@@ -19,12 +19,12 @@ pip install numpy opencv-python pillow torch ultralytics pytesseract requests gy
 7. In line 41, enter your virtual camera number (1-3).
 8. In line 43, enter your API key.
 9. Restart your PC for Tesseract to start working and check the path:
-a.  Press Win+R, enter sysdm.cpl
-b. Go to the “Advanced” tab
-c. Click the “Environment Variables” button
-d. In the system variables, find the “PATH” line, open it, and you should see C:\Program Files\Tesseract-OCR. If it is not there, enter it manually.
-11. Start the game.
-12. Run Start.bat
+Press Win+R, enter sysdm.cpl
+Go to the “Advanced” tab
+Click the “Environment Variables” button
+In the system variables, find the “PATH” line, open it, and you should see C:\Program Files\Tesseract-OCR. If it is not there, enter it manually.
+10. Start the game.
+11. Run Start.bat
 
 The bot will download YOLO and start learning.
 
