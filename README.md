@@ -17,14 +17,13 @@ Or, type:
 pip install -r requirements.txt
 5. Launch OBS Studio, to the right of the “Start Virtual Camera” button, click the gear icon - Output Type: Source, Select Output: Screen Capture.
 6. In line 41, enter your virtual camera number (1-3).
-7. In line 43, enter your API key.
-8. Restart your PC for Tesseract to start working and check the path:
-9. Press Win+R, enter sysdm.cpl
-10. Go to the “Advanced” tab
-11. Click the “Environment Variables” button
-12. In the system variables, find the “PATH” line, open it, and you should see C:\Program Files\Tesseract-OCR. If it is not there, enter it manually.
-13. Start the game.
-14. Run Start.bat
+7. Restart your PC for Tesseract to start working and check the path:
+8. Press Win+R, enter sysdm.cpl
+9. Go to the “Advanced” tab
+10. Click the “Environment Variables” button
+11. In the system variables, find the “PATH” line, open it, and you should see C:\Program Files\Tesseract-OCR. If it is not there, enter it manually.
+12. Start the game.
+13. Run Start.bat
 
 The bot will download YOLO and start learning.
 
@@ -54,14 +53,14 @@ pip install numpy opencv-python pillow torch ultralytics pytesseract requests gy
 pip install -r requirements.txt
 5. Запустите OBS Studio, справа от кнопки "Запуск виртуальной камеры", нажмите шестеренку - Тип вывода: источник, Выбрать вывод: Захват экрана.
 6. В строке 41 - вставьте номер вашей виртуальной камеры (1-3).
-7. В строке 43 - вставьте ваш ключ API.
-8. Перезагрузите ПК, чтоб Tesseract начал работать и проверьте путь:
-9. Нажмите Win+R, введите sysdm.cpl
-10. Вкладка "Дополнительно"
-11. Нажмите кнопку "Переменные среды"
-12. В системных переменных найдите строку "PATH", откройте ее, вы должны видеть C:\Program Files\Tesseract-OCR, если ее нет - введите вручную.
-13. Запустите игру.
-14. Запустите Start.bat
+7. Перезагрузите ПК, чтоб Tesseract начал работать и проверьте путь:
+8. Нажмите Win+R, введите sysdm.cpl
+9. Вкладка "Дополнительно"
+10. Нажмите кнопку "Переменные среды"
+11. В системных переменных найдите строку "PATH", откройте ее, вы должны видеть C:\Program Files\Tesseract-OCR, если ее нет - введите вручную.
+12. Запустите игру.
+13. Запустите Start.bat
+
 Бот докачает YOLO и начнет обучаться.
 
 Можно вывести окно GUI бота, чтоб видеть что он делает, а также наблюдать его действия и обучения в командной строке.
