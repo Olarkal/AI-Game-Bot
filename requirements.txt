@@ -1,0 +1,12 @@
+numpy
+opencv-python
+pillow
+torch
+ultralytics
+pytesseract
+requests
+gymnasium
+stable-baselines3
+screeninfo
+pywin32
+keyboard
