@@ -15,16 +15,18 @@ Installation:
 4. Register with Tavily, copy the API key: https://app.tavily.com/
 5. Install the libraries using the command: 
 pip install numpy opencv-python pillow torch ultralytics pytesseract requests gymnasium stable-baselines3 screeninfo pywin32 keyboard
-6. Launch OBS Studio, to the right of the “Start Virtual Camera” button, click the gear icon - Output Type: Source, Select Output: Screen Capture.
-7. In line 41, enter your virtual camera number (1-3).
-8. In line 43, enter your API key.
-9. Restart your PC for Tesseract to start working and check the path:
-10. Press Win+R, enter sysdm.cpl
-11. Go to the “Advanced” tab
-12. Click the “Environment Variables” button
-13. In the system variables, find the “PATH” line, open it, and you should see C:\Program Files\Tesseract-OCR. If it is not there, enter it manually.
-14. Start the game.
-15. Run Start.bat
+Or, type:
+pip install -r requirements.txt
+7. Launch OBS Studio, to the right of the “Start Virtual Camera” button, click the gear icon - Output Type: Source, Select Output: Screen Capture.
+8. In line 41, enter your virtual camera number (1-3).
+9. In line 43, enter your API key.
+10. Restart your PC for Tesseract to start working and check the path:
+11. Press Win+R, enter sysdm.cpl
+12. Go to the “Advanced” tab
+13. Click the “Environment Variables” button
+14. In the system variables, find the “PATH” line, open it, and you should see C:\Program Files\Tesseract-OCR. If it is not there, enter it manually.
+15. Start the game.
+16. Run Start.bat
 
 The bot will download YOLO and start learning.
 
@@ -52,16 +54,18 @@ The “Caps Lock” button turns off the bot and saves the training progress.
 4. Зарегестрируйтесь в Tavily, скопируйте ключ API: https://app.tavily.com/
 5. Установите библиотеки командой: 
 pip install numpy opencv-python pillow torch ultralytics pytesseract requests gymnasium stable-baselines3 screeninfo pywin32 keyboard
-6. Запустите OBS Studio, справа от кнопки "Запуск виртуальной камеры", нажмите шестеренку - Тип вывода: источник, Выбрать вывод: Захват экрана.
-7. В строке 41 - вставьте номер вашей виртуальной камеры (1-3).
-8. В строке 43 - вставьте ваш ключ API.
-9. Перезагрузите ПК, чтоб Tesseract начал работать и проверьте путь:
-10. Нажмите Win+R, введите sysdm.cpl
-11. Вкладка "Дополнительно"
-12. Нажмите кнопку "Переменные среды"
-13. В системных переменных найдите строку "PATH", откройте ее, вы должны видеть C:\Program Files\Tesseract-OCR, если ее нет - введите вручную.
-14. Запустите игру.
-15. Запустите Start.bat
+Или же, напишите:
+pip install -r requirements.txt
+7. Запустите OBS Studio, справа от кнопки "Запуск виртуальной камеры", нажмите шестеренку - Тип вывода: источник, Выбрать вывод: Захват экрана.
+8. В строке 41 - вставьте номер вашей виртуальной камеры (1-3).
+9. В строке 43 - вставьте ваш ключ API.
+10. Перезагрузите ПК, чтоб Tesseract начал работать и проверьте путь:
+11. Нажмите Win+R, введите sysdm.cpl
+12. Вкладка "Дополнительно"
+13. Нажмите кнопку "Переменные среды"
+14. В системных переменных найдите строку "PATH", откройте ее, вы должны видеть C:\Program Files\Tesseract-OCR, если ее нет - введите вручную.
+15. Запустите игру.
+16. Запустите Start.bat
 Бот докачает YOLO и начнет обучаться.
 
 Можно вывести окно GUI бота, чтоб видеть что он делает, а также наблюдать его действия и обучения в командной строке.
