@@ -40,7 +40,6 @@ global_log_queue = queue.Queue(maxsize=100)
 
 OBS_CAMERA_INDEX = Insert your OBS VIrtual Camera
 YOLO_MODEL_PATH = "yolov8l.pt"
-TAVILY_API_KEY = "Insert your Tavily API"
 ENABLE_GUI = True
 DEFAULT_FRAME_RESIZE = (640, 480)
 
@@ -391,21 +390,24 @@ class GameEnv(gym.Env):
         config["game_description"] = desc
         self.save_config(config)
 
-    def fetch_game_description(self):
-        url = "https://api.tavily.com/search"
-        query = f"What is the main objective and how to win in {self.game_name}?"
-        payload = {
-            "api_key": TAVILY_API_KEY,
-            "query": query,
-            "search_depth": "basic",
-            "max_results": 1
-        }
-        response = requests.post(url, json=payload)
-        response.raise_for_status()
-        data = response.json()
-        desc = data.get("results", [{}])[0].get("content", "")
-        self.set_game_description(desc)
-        return desc
+    def fetch_game_description(self, lang="en"):
+        try:
+            game = self.game_name.replace(" ", "_")
+            url = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{game}"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                desc = data.get("extract", "")
+                if desc:
+                    self.set_game_description(desc)
+                    return desc
+            # если ничего не нашли — запасной вариант
+            self.set_game_description("Описание игры не найдено в Википедии.")
+            return "Описание игры не найдено в Википедии."
+        except Exception as e:
+            self.debug_print(f"Wikipedia API error: {e}")
+            self.set_game_description("Описание игры недоступно (ошибка API).")
+            return "Описание игры недоступно (ошибка API)."
 
     def analyze_game_description(self):
         if not self.game_description:
@@ -1173,4 +1175,5 @@ def main():
     print("Exiting.")
 
 if __name__ == "__main__":
+
     main()
