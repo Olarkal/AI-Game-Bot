@@ -11,7 +11,6 @@ import sys
 import traceback
 import re
 
-
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
@@ -19,6 +18,11 @@ import tkinter as tk
 
 import torch
 import torch.nn as nn
+import torchvision.transforms as T 
+try:
+    import cupy as cp 
+except ImportError:
+    cp = None
 
 from ultralytics import YOLO
 import pytesseract
@@ -35,11 +39,12 @@ import win32api
 import keyboard
 
 global_log_queue = queue.Queue(maxsize=100)
+global_stop_event = threading.Event()
 
 # Конфигурация
 
-OBS_CAMERA_INDEX = Insert your OBS VIrtual Camera
-YOLO_MODEL_PATH = "yolov8l.pt"
+OBS_CAMERA_INDEX = 2
+YOLO_MODEL_PATH = "yolov8m.pt"
 ENABLE_GUI = True
 DEFAULT_FRAME_RESIZE = (640, 480)
 
@@ -170,7 +175,6 @@ def key_to_vk(key):
     k = key.lower()
     if k in VK:
         return VK[k]
-    # attempt single char
     if len(k)==1:
         c = k
         if 'a' <= c <= 'z':
@@ -201,8 +205,14 @@ class FeatureNet(nn.Module):
 # Основной класс среды
 
 class GameEnv(gym.Env):
-    def __init__(self, game_name=""):
+    active_gui = None 
+    def __init__(self, game_name="", profile_id=0, is_final_profile=False):
         super(GameEnv, self).__init__()
+        self.profile_id = profile_id
+        self.is_final_profile = is_final_profile
+        self.total_reward = 0.0
+        self.profile_performance = {}
+        self.is_shooter = False
         self.pause_event = threading.Event()
         self.stop_event = threading.Event()
         self.frame_queue = queue.Queue(maxsize=20)
@@ -224,17 +234,29 @@ class GameEnv(gym.Env):
         self.api_call_interval = 2.0
         self.ui_mode = False
         self.current_frame = None
+        self.current_reward = 0.0
+        self.total_timesteps = 5000000
         self.game_name = game_name or self.detect_game_window_name()
         self.cap = cv2.VideoCapture(OBS_CAMERA_INDEX, cv2.CAP_DSHOW)
         if not self.cap.isOpened():
             print("Не удалось открыть виртуальную камеру OBS. Попробуй другой индекс.")
             self.check_available_cameras()
-            raise Exception("Camera open failed")
+            raise Exception("Не удалось открыть камеру")
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or DEFAULT_FRAME_RESIZE[0]
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or DEFAULT_FRAME_RESIZE[1]
-        self.debug_print(f"Camera: {self.width}x{self.height}")
+        self.debug_print(f"Виртуальная камера: {self.width}x{self.height}")
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device.type == "cuda":
+            self.debug_print(f"CUDA доступен: {torch.cuda.get_device_name(0)}")
+        else:
+            self.debug_print("CUDA недоступен, используется CPU")
+            raise RuntimeError("GPU недоступен, проверьте установку CUDA и драйверов")
+
+        # Инициализация YOLO на GPU
         self.model_yolo = YOLO(YOLO_MODEL_PATH)
+        self.model_yolo.to(self.device)
         self.debug_print(f"YOLO device: {self.model_yolo.device}")
         self.observation_space = spaces.Box(low=0, high=255, shape=(84,84,3), dtype=np.uint8)
         self.actions = [
@@ -243,7 +265,8 @@ class GameEnv(gym.Env):
             ("space", ["space"]), ("shift", ["shift"]), ("e", ["e"]), ("ctrl", ["ctrl"]),
             ("click_left", ["click_left"]), ("click_right", ["click_right"]),
             ("camera_left", ["camera_left"]), ("camera_right", ["camera_right"]),
-            ("camera_up", ["camera_up"]), ("camera_down", ["camera_down"])
+            ("camera_up", ["camera_up"]), ("camera_down", ["camera_down"]),
+            ("aim_at_person", ["aim_at_person"])
         ]
         self.action_space = spaces.Discrete(len(self.actions))
         self.action_map = [
@@ -258,10 +281,10 @@ class GameEnv(gym.Env):
             {'keys': ['e'], 'mouse_move': (0,0), 'mouse_click': None, 'duration': 0.15},
             {'keys': [], 'mouse_move': (0,0), 'mouse_click': 'left', 'duration': 0.15},
             {'keys': [], 'mouse_move': (0,0), 'mouse_click': 'right', 'duration': 0.15},
-            {'keys': [], 'mouse_move': (-500,0), 'mouse_click': None, 'duration': 0.12},
-            {'keys': [], 'mouse_move': (500,0), 'mouse_click': None, 'duration': 0.12},
-            {'keys': [], 'mouse_move': (0,-300), 'mouse_click': None, 'duration': 0.12},
-            {'keys': [], 'mouse_move': (0,300), 'mouse_click': None, 'duration': 0.12},
+            {'keys': [], 'mouse_move': (-700,0), 'mouse_click': None, 'duration': 0.12},
+            {'keys': [], 'mouse_move': (700,0), 'mouse_click': None, 'duration': 0.12},
+            {'keys': [], 'mouse_move': (0,-100), 'mouse_click': None, 'duration': 0.12},
+            {'keys': [], 'mouse_move': (0,100), 'mouse_click': None, 'duration': 0.12},
         ]
         config = self.load_config()
         self.game_description = config.get("game_description", "")
@@ -272,27 +295,46 @@ class GameEnv(gym.Env):
                 self.debug_print(f"Описание игры:, {self.game_description}")
             except Exception as e:
                 self.debug_print(f"Ошибка при получении описания:, {e}")
-        self.description_keywords = self.analyze_game_description()
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.debug_print(f"Device:, {self.device}")
+        self.description_keywords, self.is_shooter = self.analyze_game_description()
         self.feature_net = FeatureNet().to(self.device).float()
-        self.forward_model = nn.Sequential(nn.Linear(512 + len(self.actions), 512), nn.ReLU(), nn.Linear(512,512)).to(self.device).float()
-        self.optimizer = torch.optim.Adam(list(self.feature_net.parameters()) + list(self.forward_model.parameters()), lr=1e-3)
+        self.forward_model = nn.Sequential(
+            nn.Linear(512 + len(self.actions), 512),
+            nn.ReLU(),
+            nn.Linear(512, 512)
+        ).to(self.device).float()
+        self.optimizer = torch.optim.Adam(
+            list(self.feature_net.parameters()) + list(self.forward_model.parameters()),
+            lr=1e-3
+        )
         self.model = None
+        self.threads = []
         self.send_worker_thread = threading.Thread(target=self._send_worker, daemon=True)
+        self.threads.append(self.send_worker_thread)
         self.send_worker_thread.start()
         self.action_worker_thread = threading.Thread(target=self._action_worker, daemon=True)
+        self.threads.append(self.action_worker_thread)
         self.action_worker_thread.start()
         self.frame_capture_thread = threading.Thread(target=self.frame_capture_worker, daemon=True)
+        self.threads.append(self.frame_capture_thread)
         self.frame_capture_thread.start()
         self.yolo_thread = threading.Thread(target=self._yolo_worker, daemon=True)
+        self.threads.append(self.yolo_thread)
         self.yolo_thread.start()
-        if ENABLE_GUI:
-            threading.Thread(target=gui_thread, args=(self, self.stop_event), daemon=True).start()
-        threading.Thread(target=self.console_listener, args=(self.stop_event, self.pause_event), daemon=True).start()
+        if ENABLE_GUI and GameEnv.active_gui is None:
+            self.debug_print(f"Starting GUI for profile_id={self.profile_id}, is_final_profile={self.is_final_profile}")
+            GameEnv.active_gui = self
+            gui_thread_instance = threading.Thread(target=gui_thread, args=(self, self.stop_event), daemon=True)
+            self.threads.append(gui_thread_instance)
+            gui_thread_instance.start()
+            self.debug_print("Запущен поток GUI")
+        else:
+            self.debug_print(f"Пропуск GUI для profile_id={self.profile_id}, is_final_profile={self.is_final_profile}, active_gui={GameEnv.active_gui}")
+        console_thread = threading.Thread(target=self.console_listener, args=(self.stop_event, self.pause_event), daemon=True)
+        self.threads.append(console_thread)
+        console_thread.start()
         self.restrict_cursor_to_window()
-        self.actions.append(("human_mouse_move_smooth", ["human_mouse_move_smooth"]))
-        self.action_map.append({'keys': [], 'mouse_move': (0,0), 'mouse_click': None, 'duration': 0.3, 'human_mouse_smooth': True})
+        self.actions.append(("aim_at_person", ["aim_at_person"]))
+        self.action_map.append({'keys': [], 'mouse_move': (0,0), 'mouse_click': None, 'duration': 0.2, 'aim_at_person': True})
 
     def debug_print(self, message):
         if not self.pause_event.is_set():
@@ -302,13 +344,16 @@ class GameEnv(gym.Env):
         import os
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_path = save_path or f"profiles/{self.game_name}"
+        save_path = save_path or f"profiles/{self.game_name}/profile_{self.profile_id}"
         os.makedirs(save_path, exist_ok=True)
         try:
             if hasattr(self, 'model') and self.model is not None:
                 ppo_save_path = os.path.join(save_path, f"ppo_model_{timestamp}.zip")
                 self.model.save(ppo_save_path)
                 self.debug_print(f"PPO модель сохранена в {ppo_save_path}")
+                config = self.load_config()
+                config["total_reward"] = self.total_reward
+                self.save_config(config)
         except Exception as e:
             self.debug_print(f"Ошибка при сохранении PPO модели: {e}")
         try:
@@ -347,37 +392,109 @@ class GameEnv(gym.Env):
             self.debug_print(f"Ошибка при загрузке forward_model: {e}")
         self.optimizer = torch.optim.Adam(list(self.feature_net.parameters()) + list(self.forward_model.parameters()), lr=1e-3)
 
-    def console_listener(self, stop_event, pause_event):
-        import keyboard
-        print("Консольный слушатель запущен. Нажмите '=' для паузы/возобновления, 'Caps Lock' для остановки и сохранения")
-        last_pressed = None
-        while not stop_event.is_set():
+    def evolve_model(self, profile_paths):
+        """
+        Эволюция модели: выбирает лучшую модель по total_reward и применяет мутации или скрещивание.
+        profile_paths: список путей к профилям с их конфигами и моделями.
+        """
+        # Собираем производительность всех профилей
+        performances = []
+        for profile_path in profile_paths:
+            config_path = os.path.join(profile_path, "config.json")
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    total_reward = config.get("total_reward", 0.0)
+                    performances.append((profile_path, total_reward))
+        
+        if not performances:
+            self.debug_print("Нет доступных профилей для эволюции")
+            return None
+        
+        # Сортируем по суммарной награде (убывание)
+        performances.sort(key=lambda x: x[1], reverse=True)
+        best_profile, best_reward = performances[0]
+        self.debug_print(f"Лучший профиль: {best_profile} с наградой {best_reward}")
+
+        # Загружаем лучшую модель
+        ppo_files = [f for f in os.listdir(best_profile) if f.startswith("ppo_model_") and f.endswith(".zip")]
+        feature_net_files = [f for f in os.listdir(best_profile) if f.startswith("feature_net_") and f.endswith(".pth")]
+        forward_model_files = [f for f in os.listdir(best_profile) if f.startswith("forward_model_") and f.endswith(".pth")]
+        
+        if not (ppo_files and feature_net_files and forward_model_files):
+            self.debug_print("Не найдены файлы модели в лучшем профиле")
+            return None
+        
+        latest_ppo = max(ppo_files, key=lambda f: os.path.getmtime(os.path.join(best_profile, f)))
+        latest_feature_net = max(feature_net_files, key=lambda f: os.path.getmtime(os.path.join(best_profile, f)))
+        latest_forward_model = max(forward_model_files, key=lambda f: os.path.getmtime(os.path.join(best_profile, f)))
+        
+        self.load_training_state(
+            ppo_path=os.path.join(best_profile, latest_ppo),
+            feature_net_path=os.path.join(best_profile, latest_feature_net),
+            forward_model_path=os.path.join(best_profile, latest_forward_model)
+        )
+        
+        # Применяем мутации к feature_net и forward_model
+        with torch.no_grad():
+            for param in self.feature_net.parameters():
+                noise = torch.randn_like(param) * 0.05  # Небольшая мутация (5% шума)
+                param.add_(noise)
+            for param in self.forward_model.parameters():
+                noise = torch.randn_like(param) * 0.05
+                param.add_(noise)
+        
+        self.debug_print("Эволюция модели завершена: загружен лучший профиль с мутацией")
+        return best_profile
+
+    def cleanup(self):
+        self.debug_print(f"Очистка GameEnv для profile_id={self.profile_id}")
+        self.stop_event.set()
+        self.release_all_keys()
+        try:
+            if self.cap and self.cap.isOpened():
+                self.cap.release()
+                self.debug_print("Освобождение видеозахвата")
+        except:
+            self.debug_print("Ошибка при освобождении видеозахвата")
+        for thread in self.threads:
+            if thread.is_alive():
+                self.debug_print(f"Ожидание потока {thread.name} для завершения")
+                thread.join(timeout=1.0)
+        if GameEnv.active_gui == self:
+            GameEnv.active_gui = None
+
+    def console_listener(self, stop_event: threading.Event, pause_event: threading.Event):
+        self.debug_print("Консольный слушатель запущен. Нажмите '=' для паузы/возобновления, 'Caps Lock' для остановки и сохранения")
+        while not stop_event.is_set() and not global_stop_event.is_set():
             try:
-                event = keyboard.read_event(suppress=False)
-                if event.event_type == keyboard.KEY_DOWN:
-                    if event.name == '=' and last_pressed != '=':
-                        if pause_event.is_set():
-                            pause_event.clear()
-                            msg = "Bot возобновил работу"
-                        else:
-                            pause_event.set()
-                            msg = "Bot приостановлен."
-                        print(msg)
-                        global_log_queue.put(msg)
-                        last_pressed = '='
-                    elif event.name == 'caps lock' and last_pressed != 'caps lock':
-                        print("Обнаружено 'Caps Lock' key, сохранение состояния и остановка бота...")
-                        if hasattr(self, 'save_training_state'):
-                            self.save_training_state()
-                        stop_event.set()
-                        break
-                elif event.event_type == keyboard.KEY_UP:
-                    if event.name in ('=', 'caps lock'):
-                        last_pressed = None  # Сбрасываем, когда клавиша отпущена
-                    time.sleep(0.01)
+                if keyboard.is_pressed("="):
+                    if not pause_event.is_set():
+                        pause_event.set()
+                        self.debug_print("Бот остановлен на '='")
+                    else:
+                        pause_event.clear()
+                        self.debug_print("Бот возобновлен на '='")
+                    while keyboard.is_pressed("="):
+                        time.sleep(0.01)  # Ждём отпускания клавиши
+                if keyboard.is_pressed("capslock"):
+                    self.debug_print("Caps Lock нажат, выключение бота")
+                    self.save_training_state()
+                    stop_event.set()
+                    global_stop_event.set()
+                    self.release_all_keys()
+                    try:
+                        self.cap.release()
+                    except:
+                        pass
+                    self.debug_print("Бот остановлен и состояние сохранено")
+                    while keyboard.is_pressed("capslock"):
+                        time.sleep(0.01)  # Ждём отпускания клавиши
+                    break  # Выходим из цикла, чтобы избежать перезапуска
+                time.sleep(0.01)
             except Exception as e:
-                self.debug_print(f"ошибка консольного слушателя: {e}")
-        print("Консольный слушатель остановлен")
+                traceback.print_exc()
+                time.sleep(1)
 
     def detect_game_window_name(self):
         hwnd = win32gui.GetForegroundWindow()
@@ -405,7 +522,6 @@ class GameEnv(gym.Env):
             self.set_game_description("Описание игры не найдено в Википедии.")
             return "Описание игры не найдено в Википедии."
         except Exception as e:
-            self.debug_print(f"Wikipedia API error: {e}")
             self.set_game_description("Описание игры недоступно (ошибка API).")
             return "Описание игры недоступно (ошибка API)."
 
@@ -413,14 +529,17 @@ class GameEnv(gym.Env):
         if not self.game_description:
             return []
         description = self.game_description.lower()
-        keywords = ["collect", "build", "craft", "survive", "attack", "jump", "interact", "kill", "move", "delivery"]
+        shooter_keywords = ["shoot", "shooter", "first-person", "fps", "third-person", "tps", "kill", "eliminate", "aim", "weapon", "gun", "battle", "combat", "fire", "reload"]
+    # Проверяем, является ли игра шутером
+        is_shooter = any(kw in description for kw in shooter_keywords) or any(shooter_game in self.game_name.lower() for shooter_game in ["counter-strike", "call of duty", "battlefield", "valorant", "overwatch", "cs2"])
+        keywords = ["collect", "build", "craft", "survive", "attack", "jump", "interact", "kill", "move", "delivering"]
         if "minecraft" in self.game_name.lower():
             keywords.extend(["ender dragon", "end portal", "craft", "ender pearl", "blaze rod"])
-        if "counter-strike" in self.game_name.lower():
+        if is_shooter:
             keywords = ["shoot", "kill", "eliminate", "plant", "defuse", "objective", "aim", "reload"]
         found_keywords = [kw for kw in keywords if kw in description]
         self.debug_print(f"Извлечённые ключевые слова из описания: {found_keywords}")
-        return found_keywords
+        return found_keywords, is_shooter
 
     def get_game_window_rect(self):
         hwnd = win32gui.FindWindow(None, self.game_name)
@@ -436,16 +555,18 @@ class GameEnv(gym.Env):
             rect = self.get_game_window_rect()
             if rect:
                 win32api.ClipCursor(rect)
-                self.debug_print(f"Курсор ограничен в окне (UI-режим): {rect}")
             else:
-                self.debug_print("Не удалось ограничить курсор: окно не найдено.")
+                pass
         else:
             ctypes.windll.user32.ClipCursor(None)
-            self.debug_print("Курсор освобождён (игровой режим).")
         
     # YOLO worker
 
     def _yolo_worker(self):
+        transform = T.Compose([
+            T.ToTensor(),
+            T.Resize((640, 640))  # Уменьшаем размер для ускорения
+        ])
         while not self.stop_event.is_set():
             try:
                 if self.pause_event.is_set():
@@ -459,15 +580,18 @@ class GameEnv(gym.Env):
                 if frame is None or frame.size == 0: 
                     time.sleep(0.05)
                     continue
-                frame_small = cv2.resize(frame, (320, 240))
-                results = self.model_yolo(frame_small, conf=0.25, verbose=False)
+                frame_tensor = transform(frame).unsqueeze(0).to(self.device)
+                with torch.inference_mode():  # Отключаем градиенты для ускорения
+                    results = self.model_yolo(frame_tensor, classes=[0], conf=0.3, verbose=False)
+                detected_classes = [results[0].names[int(det[5])] for det in results[0].boxes.data]
+                self.debug_print(f"YOLO detections: {detected_classes}")
                 with self.lock:
                     self.yolo_results = results
                     self.annotated_frame = results[0].plot() if results else frame.copy()
                     self.annotated_frame = cv2.resize(self.annotated_frame, (self.width, self.height))
                 time.sleep(0.05)
             except Exception as e:
-                self.debug_print(f"YOLO worker error:", {e})
+                self.debug_print(f"YOLO worker error: {e}")
                 traceback.print_exc()
                 time.sleep(0.1)
 
@@ -505,7 +629,6 @@ class GameEnv(gym.Env):
                         for vk in vks:
                             key_name = vk_to_name(vk)
                             global_log_queue.put(f"Нажата клавиша: {key_name}")
-                            self.debug_print(f"Отправлено нажатие клавиши: {key_name}")
                 elif typ == 'release_keys':
                     vks = item.get('vks', [])
                     inputs = [make_key_input(vk, down=False) for vk in vks]
@@ -513,14 +636,12 @@ class GameEnv(gym.Env):
                         send_input(inputs)
                         for vk in vks:
                             global_log_queue.put(f"Отпущена клавиша: {vk}")
-                            self.debug_print(f"Отправлено отпускание клавиши: {vk}")
                 elif typ == 'mouse_move':
                     dx = item.get('dx', 0)
                     dy = item.get('dy', 0)
                     if dx != 0 or dy != 0:
                         send_input([make_mouse_move(dx, dy)])
                         global_log_queue.put(f"Движение мыши: dx={dx}, dy={dy}")
-                        self.debug_print(f"Отправлено движение мыши: dx={dx}, dy={dy}")
                 elif typ == 'mouse_move_absolute':
                     x = item.get('x')
                     y = item.get('y')
@@ -529,18 +650,15 @@ class GameEnv(gym.Env):
                         new_y = max(rect[1], min(rect[3] - 1, y))
                         send_input([set_mouse_position(new_x, new_y)])
                         global_log_queue.put(f"Абсолютное движение мыши: x={new_x}, y={new_y}")
-                        self.debug_print(f"Отправлено абсолютное движение мыши: x={new_x}, y={new_y}")
                     else:
                         send_input([set_mouse_position(x, y)])
                         global_log_queue.put(f"Абсолютное движение мыши: x={x}, y={y}")
-                        self.debug_print(f"Отправлено абсолютное движение мыши: x={x}, y={y}")
                 elif typ == 'mouse_click':
                     btn = item.get('button', 'left')
                     down = item.get('down', True)
                     send_input([make_mouse_click(btn, down)])
                     click_type = "нажатие" if down else "отпускание"
                     global_log_queue.put(f"{click_type} кнопки мыши ({btn})")
-                    self.debug_print(f"Отправлено {click_type} кнопки мыши: {btn}")
                 time.sleep(0.001)
             except queue.Empty:
                 continue
@@ -704,6 +822,24 @@ class GameEnv(gym.Env):
         target_y = max(top, min(cur_y + dy, bottom - 1))
         self.smooth_mouse_move(target_x, target_y, steps=steps, total_time=total_time)
 
+    def aim_at_person(self, yolo_results):
+        if not yolo_results or not yolo_results[0].boxes.data.numel():
+            self.debug_print("No valid YOLO results for aiming")
+            return
+        for det in yolo_results[0].boxes.data:
+            cls = int(det[5])
+            cls_name = yolo_results[0].names.get(cls, "").lower()
+            if cls_name == "person":
+                x1, y1, x2, y2 = det[:4].cpu().numpy()
+                center_x = (x1 + x2) / 2
+                center_y = (y1 + y2) / 2
+                game_rect = self.get_game_window_rect()
+                if game_rect:
+                    screen_x = game_rect[0] + (center_x / self.width) * (game_rect[2] - game_rect[0])
+                    screen_y = game_rect[1] + (center_y / self.height) * (game_rect[3] - game_rect[1])
+                    self.smooth_mouse_move(screen_x, screen_y, steps=10, total_time=0.2)
+                break
+
     # Camera / OCR / YOLO helpers
 
     def check_available_cameras(self):
@@ -772,8 +908,13 @@ class GameEnv(gym.Env):
         return self.current_state, {}
 
     def get_state(self, frame):
-        frame_small = cv2.resize(frame, (84,84))
-        return frame_small
+        transform = T.Compose([
+            T.ToTensor(),
+            T.Resize((84, 84))
+        ])
+        frame_tensor = transform(frame).to(self.device)
+        frame_np = frame_tensor.cpu().numpy().transpose(1, 2, 0) * 255
+        return frame_np.astype(np.uint8)
 
     def step(self, action):
         start_time = time.time()
@@ -808,7 +949,7 @@ class GameEnv(gym.Env):
             input_tensor = torch.cat((current_feature.squeeze(0), action_onehot))
             pred_feature = self.forward_model(input_tensor)
         except Exception as e:
-            self.debug_print(f"Feature net error: {e}")
+            self.debug_print(f"Ошибка {e}")
             pred_feature = torch.zeros(512, device=self.device)
 
         self.perform_action(action)
@@ -828,6 +969,7 @@ class GameEnv(gym.Env):
         try:
             new_img_tensor = torch.tensor(new_state.transpose(2,0,1)[None], dtype=torch.float32, device=self.device)
             new_feature = self.feature_net(new_img_tensor)
+            intrinsic = ((pred_feature - new_feature.squeeze(0)) ** 2).mean().item()
             intrinsic = min(intrinsic, 1000.0)
         except Exception:
             intrinsic = 0.0
@@ -837,14 +979,15 @@ class GameEnv(gym.Env):
             with self.lock:
                 yolo_results = self.yolo_results
         except Exception as e:
-            self.debug_print(f"YOLO results error:", {e})
+            self.debug_print(f"Ошибка результатов YOLO: {e}")
 
         current_objects = set()
         exploration_reward = 0.0
         web_action_reward = 0.0
         enemy_reward = 0.0
-        relevant_classes = ['person', 'animal', 'block', 'item']
-        if "counter-strike" in self.game_name.lower():
+        # Динамическое определение релевантных классов
+        relevant_classes = ['person', 'item', 'object']  # Базовые классы для универсальности
+        if self.is_shooter:
             relevant_classes = ['person', 'weapon', 'bomb']
         elif "minecraft" in self.game_name.lower():
             relevant_classes = ['person', 'animal', 'block', 'item']
@@ -852,36 +995,80 @@ class GameEnv(gym.Env):
             if kw in ['collect', 'craft', 'build']:
                 relevant_classes.extend(['item', 'block'])
             elif kw in ['attack', 'shoot', 'kill', 'eliminate']:
-                relevant_classes.append('person')
+                relevant_classes.extend(['person', 'weapon'])
             elif kw in ['plant', 'defuse']:
                 relevant_classes.append('bomb')
-        relevant_classes = list(set(relevant_classes))
+        relevant_classes = list(set(relevant_classes))  # Убираем дубликаты
         self.debug_print(f"Релевантные классы YOLO для {self.game_name}: {relevant_classes}")
-    
+
         if yolo_results:
             try:
-                for det in yolo_results[0].boxes.data:
-                    cls = int(det[5])
-                    cls_name = yolo_results[0].names.get(cls, "unknown").lower()
-                    if cls_name in relevant_classes:
-                        current_objects.add(cls_name)
-                        if cls_name == "person" and self.actions[action][0] == "click_left" and "counter-strike" in self.game_name.lower():
-                            enemy_reward += 1.0
-                            self.debug_print(f"Вознаграждение за стрельбу по противнику: {enemy_reward}")
-                        if cls_name in ["animal", "block", "item"] and self.actions[action][0] in ["click_left", "e"]:
-                            enemy_reward += 0.5
-                            self.debug_print(f"Вознаграждение за взаимодействие с {cls_name}: {enemy_reward}")
+                if not yolo_results[0].boxes.data.tolist():  # Проверяем, пустой ли тензор
+                    self.debug_print("Обнаружения YOLO отсутствуют")
+                else:
+                    frame_height, frame_width = self.height, self.width
+                    center_x_frame = frame_width / 2
+                    center_y_frame = frame_height / 2
+                    center_threshold = 0.01  # ~5 пикселей для 640x480
+
+                    detected_classes = []
+                    for det in yolo_results[0].boxes.data:
+                        cls = int(det[5])
+                        cls_name = yolo_results[0].names.get(cls, "unknown").lower()
+                        detected_classes.append(cls_name)
+                        if cls_name in relevant_classes:
+                            current_objects.add(cls_name)
+                            if cls_name == "person" and self.is_shooter:
+                                x1, y1, x2, y2 = det[:4].cpu().numpy()
+                                center_x = (x1 + x2) / 2
+                                center_y = (y1 + y2) / 2
+                                is_in_center = (abs(center_x - center_x_frame) < frame_width * center_threshold and
+                                                abs(center_y - center_y_frame) < frame_height * center_threshold)
+                                if self.actions[action][0] == "click_left" and is_in_center:
+                                    enemy_reward += 10.0
+                                    self.debug_print(f"Вознаграждение за стрельбу по противнику в центре: {enemy_reward}")
+                                elif self.actions[action][0] == "aim_at_person":
+                                    if is_in_center:
+                                        enemy_reward += 5.0  # Увеличенная награда за точное наведение
+                                        self.debug_print(f"Вознаграждение за наведение на противника в центре: {enemy_reward}")
+                                    else:
+                                        enemy_reward += 1.0  # Бонус за выбор наведения при обнаружении
+                                        self.debug_print(f"Бонус за выбор наведения на противника: {enemy_reward}")
+                            elif cls_name in ["weapon", "bomb", "item", "block"] and self.actions[action][0] in ["click_left", "e"]:
+                                enemy_reward += 0.5
+                                self.debug_print(f"Вознаграждение за взаимодействие с {cls_name}: {enemy_reward}")
+
+                    self.debug_print(f"Обнаруженные классы YOLO: {detected_classes}")
+
+                    # Штраф за случайный выстрел в шутерах
+                    if self.is_shooter and self.actions[action][0] == "click_left":
+                        person_in_center = False
+                        for det in yolo_results[0].boxes.data:
+                            cls = int(det[5])
+                            cls_name = yolo_results[0].names.get(cls, "unknown").lower()
+                            if cls_name == "person":
+                                x1, y1, x2, y2 = det[:4].cpu().numpy()
+                                center_x = (x1 + x2) / 2
+                                center_y = (y1 + y2) / 2
+                                if (abs(center_x - center_x_frame) < frame_width * center_threshold and
+                                    abs(center_y - center_y_frame) < frame_height * center_threshold):
+                                    person_in_center = True
+                                    break
+                        if not person_in_center:
+                            enemy_reward -= 1.5  # Увеличенный штраф за неточную стрельбу
+                            self.debug_print("Штраф за случайный выстрел: -1.5")
+
                 new_objects = current_objects - self.prev_objects
                 exploration_reward = min(len(new_objects) * 0.5, 2.0)
-                self.debug_print(f"New objects detected: {new_objects}")
+                self.debug_print(f"Новые обнаруженные объекты: {new_objects}")
                 for obj in new_objects:
                     actions = self.search_object_info(obj)
-                    self.debug_print(f"API call result for {obj}: {actions}")
+                    self.debug_print(f"Результат вызова API для {obj}: {actions}")
                     if actions:
                         web_action_reward += 0.2
                 self.prev_objects = current_objects
             except Exception as e:
-                self.debug_print(f"YOLO processing error:", {e})
+                self.debug_print(f"Ошибка обработки YOLO: {e}")
 
         self.ui_mode = self.detect_ui(frame, ocr_text, yolo_results)
         self.restrict_cursor_to_window()
@@ -890,34 +1077,35 @@ class GameEnv(gym.Env):
 
         change_reward = self.calculate_change_reward(self.prev_frame, frame) if ret else 0.0
         ocr_reward = self.calculate_ocr_reward(self.prev_ocr_text, ocr_text)
-    
+
         if self.description_keywords:
             action_name = self.actions[action][0]
-            if "counter-strike" in self.game_name.lower():
-                if any(kw in self.description_keywords for kw in ["shoot", "kill", "eliminate"]) and action_name == "click_left":
-                    description_reward += 1.0
-                    self.debug_print(f"Вознаграждение за действие {action_name} (описание): {description_reward}")
-                elif "jump" in self.description_keywords and action_name == "space":
-                    description_reward += 0.3
-                elif "objective" in self.description_keywords and action_name == "e":
-                    description_reward += 0.4
-                elif "plant" in self.description_keywords and action_name == "e":
-                    description_reward += 0.5
-                elif "defuse" in self.description_keywords and action_name == "e":
-                    description_reward += 0.5
-            else:
-                if "collect" in self.description_keywords and action_name == "e":
-                    description_reward += 0.5
-                elif "jump" in self.description_keywords and action_name == "space":
-                    description_reward += 0.3
-                elif "attack" in self.description_keywords and action_name in ["click_left", "click_right"]:
-                    description_reward += 0.4
-                elif "craft" in self.description_keywords and action_name == "e" and self.ui_mode:
-                    description_reward += 0.6
+            if any(kw in self.description_keywords for kw in ["shoot", "kill", "eliminate"]) and action_name == "click_left":
+                description_reward += 1.0
                 self.debug_print(f"Вознаграждение за действие {action_name} (описание): {description_reward}")
+            elif any(kw in self.description_keywords for kw in ["shoot", "kill", "eliminate"]) and action_name == "aim_at_person":
+                description_reward += 0.5
+                self.debug_print(f"Вознаграждение за действие {action_name} (описание): {description_reward}")
+            elif "jump" in self.description_keywords and action_name == "space":
+                description_reward += 0.3
+            elif "objective" in self.description_keywords and action_name == "e":
+                description_reward += 0.4
+            elif "plant" in self.description_keywords and action_name == "e":
+                description_reward += 0.5
+            elif "defuse" in self.description_keywords and action_name == "e":
+                description_reward += 0.5
+            elif "collect" in self.description_keywords and action_name == "e":
+                description_reward += 0.5
+            elif "attack" in self.description_keywords and action_name in ["click_left", "click_right"]:
+                description_reward += 0.4
+            elif "craft" in self.description_keywords and action_name == "e" and self.ui_mode:
+                description_reward += 0.6
+            self.debug_print(f"Вознаграждение за действие {action_name} (описание): {description_reward}")
 
         reward = intrinsic * 0.001 + exploration_reward + change_reward + ocr_reward + web_action_reward + enemy_reward
-        self.debug_print(f"Reward components: intrinsic={intrinsic*0.1:.2f}, exploration={exploration_reward:.2f}, change={change_reward:.2f}, ocr={ocr_reward:.2f}, web={web_action_reward:.2f}, enemy={enemy_reward:.2f}")
+        self.current_reward = reward
+        self.total_reward += reward
+        self.debug_print(f"Компоненты вознаграждения: intrinsic={intrinsic*0.001:.2f}, exploration={exploration_reward:.2f}, change={change_reward:.2f}, ocr={ocr_reward:.2f}, web={web_action_reward:.2f}, enemy={enemy_reward:.2f}")
 
         try:
             loss = ((pred_feature - new_feature.squeeze(0).detach()) ** 2).mean()
@@ -949,49 +1137,48 @@ class GameEnv(gym.Env):
 
     def perform_action(self, action):
         action_dict = self.action_map[action]
-        if self.ui_mode:
-            if 'e' in action_dict.get('keys', []):
-                pass
-            else:
-                return
+        if self.ui_mode and 'e' not in action_dict.get('keys', []) and not action_dict.get('aim_at_person', False):
+            return
+        if action_dict.get('aim_at_person', False):
+            with self.lock:
+                self.aim_at_person(self.yolo_results)
         self.action_queue.put(action_dict)
 
-    def search_object_info(self, obj_name):
+    def search_object_info(self, obj_name, lang="en"):
         current_time = time.time()
-        #if obj_name in self.known_objects:
-         #   print(f"Using cached object info for {obj_name}: {self.known_objects[obj_name]}")
-          #  return self.known_objects[obj_name]
+        if obj_name in self.known_objects:
+            print(f"Using cached object info for {obj_name}: {self.known_objects[obj_name]}")
+            return self.known_objects[obj_name]
+
         if current_time - self.last_api_call < self.api_call_interval:
             print(f"API call skipped for {obj_name} due to rate limit")
             return []
-        self.debug_print(f"Sending API request for object: {obj_name}")
+
+        self.debug_print(f"Sending Wikipedia request for object: {obj_name}")
         try:
-            url = "https://api.tavily.com/search"
-            query = f"What is a {obj_name} in {self.game_name} ? What am I need to did?  Actions like shoot, attack, or press keys"
-            payload = {
-                "api_key": TAVILY_API_KEY,
-                "query": query,
-                "search_depth": "advanced",
-                "max_results": 5
-            }
-            response = requests.post(url, json=payload)
-            response.raise_for_status()
+            page = obj_name.replace(" ", "_")
+            url = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{page}"
+            response = requests.get(url, timeout=5)
+            if response.status_code != 200:
+                self.debug_print(f"Wikipedia returned {response.status_code} for {obj_name}")
+                return []
+
             data = response.json()
-            self.debug_print(f"API response for {obj_name}: {data}")
+            content = data.get("extract", "").lower()
             actions = []
-            for result in data.get("results", []):
-                content = result.get("content", "").lower()
-                if "press" in content or "click" in content or "interact" in content:
-                    if "e" in content:
-                        actions.append("e")
-                    if "click" in content:
-                        actions.append("click_left")
-                    if "right click" in content:
-                        actions.append("click_right")
-            if "counter-strike" in self.game_name.lower() and obj_name == "person":
-                actions.extend(["click_left", "e"])
-            actions = list(set(actions))
-            self.known_objects[obj_name] = actions
+            
+            if "press e" in content or "interact" in content:
+                actions.append("e")
+            if "click" in content or "attack" in content or "shoot" in content:
+                actions.append("click_left")
+            if "right click" in content:
+                actions.append("click_right")
+
+            if self.is_shooter and obj_name == "person":
+                actions.extend(["click_left", "e", "aim_at_person"])
+
+            actions = list(set(actions)) or ["unknown"]
+            self.known_objects[obj_name] = actions or ["unknown"]
             self.save_config()
             self.last_api_call = current_time
             self.debug_print(f"Saved object info for {obj_name}: {actions}")
@@ -1002,13 +1189,14 @@ class GameEnv(gym.Env):
 
     def load_config(self):
         safe_name = re.sub(r'[:\\/*?"<>|]', "_", self.game_name)
-        profile_dir = f"profiles/{self.game_name}"
+        profile_dir = f"profiles/{self.game_name}/profile_{self.profile_id}"
         os.makedirs(profile_dir, exist_ok=True)
         config_path = f"{profile_dir}/config.json"
         default_config = {
             "actions": {str(i): act[0] for i, act in enumerate(self.actions)},
             "rewards": {},
-            "known_objects": {}
+            "known_objects": {},
+            "total_reward": 0.0
         }
         if not os.path.exists(config_path):
             with open(config_path, 'w') as f:
@@ -1018,14 +1206,16 @@ class GameEnv(gym.Env):
             config = json.load(f)
             config = {**default_config, **config}
             self.known_objects = config.get("known_objects", {})
+            self.total_reward = config.get("total_reward", 0.0)
             return config
         
     def save_config(self, config=None):
-        profile_dir = f"profiles/{self.game_name}"
+        profile_dir = f"profiles/{self.game_name}/profile_{self.profile_id}"
         config_path = f"{profile_dir}/config.json"
-        conf = {
+        conf = config or{
             "actions": {str(i): act[0] for i, act in enumerate(self.actions)},
-            "known_objects": self.known_objects
+            "known_objects": self.known_objects,
+            "total_reward": self.total_reward
         }
         with open(config_path, 'w') as f:
             json.dump(conf, f, indent=4)
@@ -1046,12 +1236,13 @@ def gui_thread(env: GameEnv, stop_event: threading.Event):
         root.geometry(geom)
         video_label = tk.Label(root)
         video_label.pack(fill="both", expand=True)
-        info_label = tk.Label(root, text="FPS: 0.0 | Held: [] | UI: False")
+        info_label = tk.Label(root, text="FPS: 0.0 | Held: [] | UI: False | Steps: 0/5000000 | Reward: 0.0")
         info_label.pack()
         log_text = tk.Text(root, height=6)
         log_text.pack(fill="x")
         frame_count = 0
         start_time = time.time()
+
         def update():
             nonlocal frame_count, start_time
             if stop_event.is_set():
@@ -1062,7 +1253,7 @@ def gui_thread(env: GameEnv, stop_event: threading.Event):
                 return
             if env.pause_event.is_set():
                 info_label.config(text="Bot paused")
-                root.after(100, update)
+                root.after(50, update)
                 return
             try:
                 with env.lock:
@@ -1083,28 +1274,29 @@ def gui_thread(env: GameEnv, stop_event: threading.Event):
                     return
                 with env.held_keys_lock:
                     held = [env.actions[i][0] if isinstance(i, int) else str(i) for i in env.held_keys]
-                info_label.config(text=f"FPS: {frame_count/(time.time()-start_time+1e-9):.1f} | Held: {held} | UI: {env.ui_mode}")
-                while not global_log_queue.empty() and not env.pause_event.is_set():
+                steps = env.frame_processed  # Используем frame_processed для шагов
+                reward = env.total_reward   # Используем total_reward для общей суммы наград
+                info_label.config(text=f"FPS: {frame_count/(time.time()-start_time+1e-9):.1f} | Held: {held} | UI: {env.ui_mode} | Steps: {steps}/{env.total_timesteps} | Total Reward: {reward:.2f}")
+                max_logs = 5
+                for _ in range(max_logs):
+                    if global_log_queue.empty() or env.pause_event.is_set():
+                        break
                     log_text.insert(tk.END, global_log_queue.get_nowait() + "\n")
                     log_text.see(tk.END)
             except Exception as e:
-                print("GUI update error:", e)
                 import traceback; traceback.print_exc()
             frame_count += 1
             if frame_count % 30 == 0:
                 start_time = time.time()
                 frame_count = 0
-            root.after(50, update)  # 20 FPS
-
+            root.after(30, update)  # 30 FPS
         update()
         root.mainloop()
     except Exception as e:
-        print("GUI thread crashed:", e)
         traceback.print_exc()
         time.sleep(3)
         if not stop_event.is_set():
             gui_thread(env, stop_event)
-
 # Callbacks for RL
 
 class StopCallback(BaseCallback):
@@ -1123,9 +1315,10 @@ class SaveCallback(BaseCallback):
         if self.n_calls % self.save_freq == 0:
             try:
                 self.model.save(self.save_path)
-                self.debug_print("Model saved:", self.save_path)
+                self.model.env.envs[0].save_training_state(save_path=os.path.dirname(self.save_path))
+                self.model.env.envs[0].debug_print(f"Model saved: {self.save_path}, Total Reward: {self.model.env.envs[0].total_reward}")
             except Exception as e:
-                self.debug_print("Save error:", e)
+                self.model.env.envs[0].debug_print("Save error:", e)
         return True
 
 # Main
@@ -1138,42 +1331,101 @@ def get_game_name():
 
 def main():
     game_name = get_game_name()
-    env = GameEnv(game_name)
-    profile_dir = f"profiles/{game_name}"
-    os.makedirs(profile_dir, exist_ok=True)
-    model_path = f"{profile_dir}/model"
+    num_profiles = random.randint(3, 5)  # Случайное число профилей от 3 до 5
+    profile_paths = []
+    total_timesteps = 5000000
 
-    try:
-        model = PPO.load(model_path, env=env)
-        env.model = model
-        env.debug_print(f"Loaded existing model:, {model_path}")
-    except Exception as e:
-        env.debug_print(f"Model load error, creating new PPO:, {e}")
-        model = PPO("CnnPolicy", env, verbose=1)
-        env.model = model
+    for profile_id in range(num_profiles):
+        if global_stop_event.is_set():
+            print("Глобальное событие остановки установлено, выход из основного цикла")
+            break
 
-    callbacks = [StopCallback(env.stop_event), SaveCallback(model_path, save_freq=10000)]
-    try:
-        model.learn(total_timesteps=1000000, callback=callbacks)
-    except KeyboardInterrupt:
-        env.debug_print("KeyboardInterrupt - stopping")
-    except Exception as e:
-        env.debug_print("Training error:, {e}")
+        profile_dir = f"profiles/{game_name}/profile_{profile_id}"
+        os.makedirs(profile_dir, exist_ok=True)
+        model_path = f"{profile_dir}/model.zip"
 
-    try:
-        env.model.save(model_path)
-        env.debug_print("Model saved at end:, {model_path}")
-    except Exception as e:
-        env.debug_print("Final save error:, {e}")
+        env = GameEnv(game_name, profile_id=profile_id, is_final_profile=False)
+        env.debug_print(f"Created env for profile_id={profile_id}")
 
-    env.release_all_keys()
-    try:
-        env.cap.release()
-    except:
-        pass
-    env.stop_event.set()
-    print("Exiting.")
+        try:
+            ppo_files = [f for f in os.listdir(profile_dir) if f.startswith("ppo_model_") and f.endswith(".zip")]
+            if ppo_files:
+                latest_ppo = max(ppo_files, key=lambda f: os.path.getmtime(os.path.join(profile_dir, f)))
+                model_path = os.path.join(profile_dir, latest_ppo)
+                model = PPO.load(model_path, env=env)
+                if model.get_env().action_space.n != env.action_space.n:
+                    env.debug_print("Несоответствие пространства действий, создание новой модели PPO")
+                    model = PPO("CnnPolicy", env, verbose=1)
+                env.model = model
+                env.debug_print(f"Загружена существующая модель:{model_path}")
+            else:
+                env.debug_print("Модель не найдена, создание новой PPO")
+                model = PPO("CnnPolicy", env, verbose=1)
+                env.model = mode
+        except Exception as e:
+            env.debug_print(f"Ошибка загрузки модели, создание нового PPO: {e}")
+            model = PPO("CnnPolicy", env, verbose=1)
+            env.model = model
+
+        config = env.load_config()
+        env.frame_processed = config.get("frame_processed", 0)
+        env.total_reward = config.get("total_reward", 0.0)
+
+        callbacks = [StopCallback(env.stop_event), SaveCallback(model_path, save_freq=10000)]
+        try:
+            model.learn(total_timesteps=total_timesteps, callback=callbacks)
+            env.save_training_state()
+            profile_paths.append(profile_dir)
+        except KeyboardInterrupt:
+            env.save_training_state()
+            profile_paths.append(profile_dir)
+        except Exception as e:
+            traceback.print_exc()
+            env.save_training_state()
+            profile_paths.append(profile_dir)
+
+        config = env.load_config()
+        config["frame_processed"] = env.frame_processed
+        config["total_reward"] = env.total_reward
+        env.save_config(config)
+
+        env.cleanup()  # Заменяем release_all_keys и cap.release
+        time.sleep(1)  # Даём время на очистку ресурсов
+
+        if global_stop_event.is_set():
+            print("Глобальный стоп-событие установлено, пропуск дальнейших профилей")
+            break
+
+    if not global_stop_event.is_set():
+        final_profile_id = num_profiles
+        print("Создание окончательного профиля с is_final_profile=True")
+        final_env = GameEnv(game_name, profile_id=final_profile_id, is_final_profile=True)
+        final_env.debug_print(f"Создание окончательного профиля for profile_id={final_profile_id}")
+        best_profile = final_env.evolve_model(profile_paths)
+        if best_profile:
+            final_env.debug_print(f"Эволюционная модель создана на основе профиля {best_profile}")
+            model = PPO("CnnPolicy", final_env, verbose=1)
+            final_env.model = model
+            final_env.frame_processed = config.get("frame_processed", 0)
+            final_env.total_reward = config.get("total_reward", 0.0)
+            callbacks = [StopCallback(final_env.stop_event), SaveCallback(f"profiles/{game_name}/profile_{num_profiles}/model", save_freq=10000)]
+            try:
+                model.learn(total_timesteps=total_timesteps, callback=callbacks)
+                final_env.save_training_state()
+                config = final_env.load_config()
+                config["frame_processed"] = final_env.frame_processed
+                config["total_reward"] = final_env.total_reward
+                final_env.save_config(config)
+            except KeyboardInterrupt:
+                final_env.save_training_state()
+            except Exception as e:
+                traceback.print_exc()
+                final_env.save_training_state()
+
+        final_env.cleanup()
+        final_env.debug_print("Final env closed")
+
+    print("Програма полностью остановлена")
 
 if __name__ == "__main__":
-
     main()
