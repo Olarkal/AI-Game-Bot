@@ -2,100 +2,126 @@
 
 ## English Version
 
-The bot was created using **ChatGPT** and **Grok**.  
-The bot is based on neural learning to play games.  
-It is built on **YOLOv8** and takes images from the **OBS virtual camera**.  
+The AI Game Bot was created using **ChatGPT** and **Grok**. It is designed for neural network-based learning to play video games. The bot utilizes **YOLOv8** for computer vision and captures game footage via the **OBS virtual camera**.
 
-It was mainly tested on **CS2** and **Minecraft**, but it also works in other games.
+It was primarily tested on **Counter-Strike 2 (CS2)** and **Minecraft**, but it is compatible with other games as well.
 
-The bot detects which game is being played, asks Wikipedia what the game is and what to do in it, and, depending on the keywords, begins training.  
-If the keywords do not match, it learns by trial and error.  
+The bot detects the game being played, queries Wikipedia to understand the game and its objectives, and begins training based on identified keywords. If no matching keywords are found, it learns through trial and error.
 
-The bot was written in just **two days**, so it can be considered raw, and I am posting it “as is.”
+The bot was developed in just **two days**, so it is considered a work in progress and is shared "as is."
 
 ---
 
 ## Requirements
-1. Python 3.12.0  
-2. OBS Studio  
-3. Tesseract  
+1. Python 3.12.0
+2. OBS Studio
+3. Tesseract OCR
 
 ---
 
 ## Installation
-1. Remove all versions of Python. Install Python 3.12.0:  
-   👉 https://www.python.org/ftp/python/3.12.0/python-3.12.0-amd64.exe  
+1. Uninstall all existing Python versions and install Python 3.12.0:  
+   👉 [Download Python 3.12.0](https://www.python.org/ftp/python/3.12.0/python-3.12.0-amd64.exe)
 2. Install OBS Studio:  
-   👉 https://obsproject.com/download  
-3. Install Tesseract:  
-   👉 https://github.com/tesseract-ocr/tesseract/releases/download/5.5.0/tesseract-ocr-w64-setup-5.5.0.20241111.exe  
-4. Install the libraries using the command:  
+   👉 [Download OBS Studio](https://obsproject.com/download)
+3. Install Tesseract OCR:  
+   👉 [Download Tesseract](https://github.com/tesseract-ocr/tesseract/releases/download/5.5.0/tesseract-ocr-w64-setup-5.5.0.20241111.exe)
+4. Install required Python libraries using the following command:  
    ```bash
    pip install numpy opencv-python pillow torch ultralytics pytesseract requests gymnasium stable-baselines3 screeninfo pywin32 keyboard
+   ```
+   Alternatively, if you have a `requirements.txt` file:  
+   ```bash
+   pip install -r requirements.txt
+   ```
+5. Launch OBS Studio, locate the “Start Virtual Camera” button, click the gear icon next to it, and set:  
+   - **Output Type**: Source  
+   - **Select Output**: Screen Capture
+6. In the bot’s code (line 41), specify your virtual camera number (1–3).
+7. Restart your PC to ensure Tesseract works correctly and verify the system path:
+8. Press `Win + R`, type `sysdm.cpl`, and press Enter.
+9. Go to the **Advanced** tab.
+10. Click **Environment Variables**.
+11. In the **System Variables** section, locate the `PATH` variable and ensure `C:\Program Files\Tesseract-OCR` is included. If not, add it manually.
+12. Launch the game you want the bot to play.
+13. Run `Start.bat`.
 
-Or, type:
+The bot will download YOLOv8 and begin training.
 
-    pip install -r requirements.txt
+You can open the bot’s GUI window to monitor its actions and view training progress in the command line.
 
-5. Launch OBS Studio, to the right of the “Start Virtual Camera” button, click the gear icon - Output Type: Source, Select Output: Screen Capture.
-6. In line 41, enter your virtual camera number (1-3).
-7. Restart your PC for Tesseract to start working and check the path:
-8. Press Win+R, enter sysdm.cpl
-9. Go to the “Advanced” tab
-10. Click the “Environment Variables” button
-11. In the system variables, find the “PATH” line, open it, and you should see C:\Program Files\Tesseract-OCR. If it is not there, enter it manually.
-12. Start the game.
-13. Run Start.bat
+### Bot Controls
+- **=**: Pause the bot.
+- **Caps Lock**: Stop the bot and save training progress.
 
-The bot will download YOLO and start learning.
+---
 
-You can bring up the bot's GUI window to see what it is doing, as well as observe its actions and training in the command line.
+## Russian Version
 
-Bot control:
-The “=” button pauses the bot.
-The “Caps Lock” button turns off the bot and saves the training progress.
+Бот создан с использованием **ChatGPT** и **Grok**. Он предназначен для нейронного обучения игре в видеоигры. Бот построен на основе **YOLOv8** и получает изображение с виртуальной камеры OBS.
 
-## Русская версия
+Основное тестирование проводилось на **Counter-Strike 2 (CS2)** и **Minecraft**, но бот также совместим с другими играми.
 
-Бот создат с помощью **ChatGPT** и **Grok**.
+Бот определяет, какая игра запущена, запрашивает информацию о ней и ее целях в Wikipedia и начинает обучение на основе найденных ключевых слов. Если ключевые слова не найдены, обучение происходит методом проб и ошибок.
 
-Основа бота - нейронное обучение играть в игры. Бот построен на YOLOv8, берет картинку с виртуальной камеры OBS.  Тестировал в основном на КС2 и Майнкрафт. Но также он работает в других играх.
+Бот был разработан за **два дня**, поэтому считается незавершенным и предоставляется "как есть".
 
-Бот видит, что за игра написана, спрашивает у Wikipedia, что за игра и что в ней делать. и в зависимости от ключевых слов, начинает обучение. если ключевые слова не совпадают - он обучается методом иследования. Бот написан за 2 дня, по этому считать можно его сырым и выкладываю "как есть".
+---
 
-Требования:
+## Требования
 1. Python 3.12.0
-1. OBS Studio
-2. Tesseract
+2. OBS Studio
+3. Tesseract OCR
 
-Установка:
-1. Удалите все версии python. Установите python 3.12.0:
-     👉 https://www.python.org/ftp/python/3.12.0/python-3.12.0-amd64.exe
-3. Установите OBS Studio:
-     👉 https://obsproject.com/download
-5. Установите Tesseract:
-     👉 https://github.com/tesseract-ocr/tesseract/releases/download/5.5.0/tesseract-ocr-w64-setup-5.5.0.20241111.exe
-7. Установите библиотеки командой: 
+---
+
+## Установка
+1. Удалите все установленные версии Python и установите Python 3.12.0:  
+   👉 [Скачать Python 3.12.0](https://www.python.org/ftp/python/3.12.0/python-3.12.0-amd64.exe)
+2. Установите OBS Studio:  
+   👉 [Скачать OBS Studio](https://obsproject.com/download)
+3. Установите Tesseract OCR:  
+   👉 [Скачать Tesseract](https://github.com/tesseract-ocr/tesseract/releases/download/5.5.0/tesseract-ocr-w64-setup-5.5.0.20241111.exe)
+4. Установите необходимые библиотеки Python с помощью команды:  
    ```bash
    pip install numpy opencv-python pillow torch ultralytics pytesseract requests gymnasium stable-baselines3 screeninfo pywin32 keyboard
+   ```
+   Или, если у вас есть файл `requirements.txt`:  
+   ```bash
+   pip install -r requirements.txt
+   ```
+5. Запустите OBS Studio, найдите кнопку «Запуск виртуальной камеры», нажмите на шестеренку рядом и настройте:  
+   - **Тип вывода**: Источник  
+   - **Выбрать вывод**: Захват экрана
+6. В коде бота (строка 41) укажите номер вашей виртуальной камеры (1–3).
+7. Перезагрузите компьютер, чтобы Tesseract корректно работал, и проверьте путь:
+8. Нажмите `Win + R`, введите `sysdm.cpl` и нажмите Enter.
+9. Перейдите на вкладку **Дополнительно**.
+10. Нажмите **Переменные среды**.
+11. В разделе **Системные переменные** найдите переменную `PATH` и убедитесь, что в ней указан `C:\Program Files\Tesseract-OCR`. Если путь отсутствует, добавьте его вручную.
+12. Запустите игру, в которую должен играть бот.
+13. Запустите `Start.bat`.
 
-Или жеЖ
+Бот скачает YOLOv8 и начнет обучение.
 
-    pip install -r requirements.txt
-8. Запустите OBS Studio, справа от кнопки "Запуск виртуальной камеры", нажмите шестеренку - Тип вывода: источник, Выбрать вывод: Захват экрана.
-9. В строке 41 - вставьте номер вашей виртуальной камеры (1-3).
-10. Перезагрузите ПК, чтоб Tesseract начал работать и проверьте путь:
-11. Нажмите Win+R, введите sysdm.cpl
-12. Вкладка "Дополнительно"
-13. Нажмите кнопку "Переменные среды"
-14. В системных переменных найдите строку "PATH", откройте ее, вы должны видеть C:\Program Files\Tesseract-OCR, если ее нет - введите вручную.
-15. Запустите игру.
-16. Запустите Start.bat
+Вы можете открыть графический интерфейс бота, чтобы следить за его действиями, а также наблюдать за процессом обучения в командной строке.
 
-Бот докачает YOLO и начнет обучаться.
+### Управление ботом
+- **=**: Приостановить бота.
+- **Caps Lock**: Остановить бота и сохранить прогресс обучения.
 
-Можно вывести окно GUI бота, чтоб видеть что он делает, а также наблюдать его действия и обучения в командной строке.
+---
 
-Управление ботом:
-Кнопка "=" - пауза бота.
-Кнопка "Caps Lock" - выключение бота и сохранения прогреса обучения.
+## Technologies
+
+- **YOLOv8**: Computer vision
+- **Stable Baselines3**: Reinforcement learning
+- **Gymnasium**: Reinforcement learning environment
+- **OBS Studio**: Virtual camera
+- **Tesseract OCR**: Text recognition
+
+---
+
+## License
+
+MIT — Free to use and modify.
