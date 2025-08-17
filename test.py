@@ -252,11 +252,9 @@ class GameEnv(gym.Env):
             self.debug_print(f"CUDA доступен: {torch.cuda.get_device_name(0)}")
         else:
             self.debug_print("CUDA недоступен, используется CPU")
-            raise RuntimeError("GPU недоступен, проверьте установку CUDA и драйверов")
 
         # Инициализация YOLO на GPU
-        self.model_yolo = YOLO(YOLO_MODEL_PATH)
-        self.model_yolo.to(self.device)
+        self.model_yolo = YOLO(YOLO_MODEL_PATH).to(self.device)
         self.debug_print(f"YOLO device: {self.model_yolo.device}")
         self.observation_space = spaces.Box(low=0, high=255, shape=(84,84,3), dtype=np.uint8)
         self.actions = [
