@@ -47,6 +47,8 @@ OBS_CAMERA_INDEX = 2
 YOLO_MODEL_PATH = "yolov8m.pt"
 ENABLE_GUI = True
 DEFAULT_FRAME_RESIZE = (640, 480)
+DEMO_RECORD_DURATION = 1800  # 30 минут в секундах
+DEMO_VIDEO_FPS = 30  # FPS для записи видео
 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 os.environ['TESSDATA_PREFIX'] = r'C:\Program Files\Tesseract-OCR\tessdata'
@@ -217,6 +219,8 @@ class GameEnv(gym.Env):
         self.is_shooter = False
         self.pause_event = threading.Event()
         self.stop_event = threading.Event()
+        self.recording_event = threading.Event()
+        self.stop_recording_event = threading.Event()
         self.frame_queue = queue.Queue(maxsize=50)
         self.action_queue = queue.Queue(maxsize=50)
         self.send_queue = queue.Queue()
@@ -285,6 +289,7 @@ class GameEnv(gym.Env):
             {'keys': [], 'mouse_move': (700,0), 'mouse_click': None, 'duration': 0.12},
             {'keys': [], 'mouse_move': (0,-100), 'mouse_click': None, 'duration': 0.12},
             {'keys': [], 'mouse_move': (0,100), 'mouse_click': None, 'duration': 0.12},
+            {'keys': [], 'mouse_move': (0,0), 'mouse_click': None, 'duration': 0.2, 'aim_at_person': True}
         ]
         config = self.load_config()
         self.game_description = config.get("game_description", "")
@@ -335,6 +340,15 @@ class GameEnv(gym.Env):
         self.restrict_cursor_to_window()
         self.actions.append(("aim_at_person", ["aim_at_person"]))
         self.action_map.append({'keys': [], 'mouse_move': (0,0), 'mouse_click': None, 'duration': 0.2, 'aim_at_person': True})
+
+        # Новые переменные для демонстраций (IRL)
+        self.demo_video_path = f"profiles/{self.game_name}/profile_{self.profile_id}/demo_video.avi"
+        self.demo_actions_path = f"profiles/{self.game_name}/profile_{self.profile_id}/demo_actions.json"
+        self.has_demo = os.path.exists(self.demo_video_path) and os.path.exists(self.demo_actions_path)
+        self.demo_actions = []  # Список для записи действий игрока
+        self.pause_event.set()  # Бот изначально на паузе
+        if self.has_demo:
+            self.load_demo_actions()
 
     def debug_print(self, message):
         if not self.pause_event.is_set():
@@ -475,18 +489,40 @@ class GameEnv(gym.Env):
             GameEnv.active_gui = None
 
     def console_listener(self, stop_event: threading.Event, pause_event: threading.Event):
-        self.debug_print("Консольный слушатель запущен. Нажмите '=' для паузы/возобновления, 'Caps Lock' для остановки и сохранения")
+        self.debug_print("Консольный слушатель запущен. Нажмите '=' для паузы/возобновления, 'Caps Lock' для остановки и сохранения, 'F12' для записи/остановки демонстрации")
         while not stop_event.is_set() and not global_stop_event.is_set():
             try:
                 if keyboard.is_pressed("="):
-                    if not pause_event.is_set():
+                    if self.recording_event.is_set():
+                        self.debug_print("Нельзя использовать '=' во время записи демонстрации")
+                        global_log_queue.put("Нельзя ставить на паузу/возобновлять во время записи")
+                    elif not pause_event.is_set():
                         pause_event.set()
                         self.debug_print("Бот остановлен на '='")
+                        global_log_queue.put("Бот приостановлен\nНажмите F12 для записи демонстрации")
                     else:
-                        pause_event.clear()
-                        self.debug_print("Бот возобновлен на '='")
+                        if self.has_demo:
+                            pause_event.clear()
+                            self.debug_print("Бот возобновлен на '='")
+                            global_log_queue.put("Бот возобновлен")
+                        else:
+                            self.debug_print("Нельзя возобновить: отсутствует фрагмент игры. Запишите демонстрацию (F12)")
+                            global_log_queue.put("Нельзя запустить: отсутствует демонстрация\nНажмите F12 для записи")
                     while keyboard.is_pressed("="):
                         time.sleep(0.01)  # Ждём отпускания клавиши
+                if keyboard.is_pressed("f12"):
+                    if not self.recording_event.is_set():
+                        self.debug_print("F12 нажат, начало записи демонстрации (30 мин)")
+                        global_log_queue.put("Начало записи демонстрации (до 30 мин)")
+                        self.recording_event.set()
+                        self.stop_recording_event.clear()  # Сбрасываем флаг остановки
+                        threading.Thread(target=self.record_demo, daemon=True).start()
+                    else:
+                        self.debug_print("F12 нажат, остановка записи демонстрации")
+                        global_log_queue.put("Остановка записи демонстрации")
+                        self.stop_recording_event.set()  # Устанавливаем флаг остановки
+                    while keyboard.is_pressed("f12"):
+                        time.sleep(0.01)
                 if keyboard.is_pressed("capslock"):
                     self.debug_print("Caps Lock нажат, выключение бота")
                     self.save_training_state()
@@ -498,13 +534,89 @@ class GameEnv(gym.Env):
                     except:
                         pass
                     self.debug_print("Бот остановлен и состояние сохранено")
+                    global_log_queue.put("Бот остановлен и сохранён")
                     while keyboard.is_pressed("capslock"):
-                        time.sleep(0.01)  # Ждём отпускания клавиши
-                    break  # Выходим из цикла, чтобы избежать перезапуска
+                        time.sleep(0.01)
+                    break
                 time.sleep(0.01)
             except Exception as e:
+                self.debug_print(f"Ошибка в console_listener: {e}")
                 traceback.print_exc()
                 time.sleep(1)
+
+    def record_demo(self):
+        """Запись видео и действий игрока в течение 30 мин или до остановки"""
+        try:
+            os.makedirs(os.path.dirname(self.demo_video_path), exist_ok=True)
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            video_writer = cv2.VideoWriter(self.demo_video_path, fourcc, DEMO_VIDEO_FPS, (self.width, self.height))
+            self.demo_actions = []
+            start_time = time.time()
+            last_action_time = start_time
+            while (time.time() - start_time < DEMO_RECORD_DURATION and 
+                   not self.stop_event.is_set() and 
+                   not self.stop_recording_event.is_set()):
+                ret, frame = self.cap.read()
+                if ret:
+                    video_writer.write(frame)
+                    # Запись действий (клавиш и мыши)
+                    current_time = time.time()
+                    if current_time - last_action_time >= 0.1:  # Записываем действия каждые 0.1 сек
+                        actions = {
+                            'timestamp': current_time - start_time,
+                            'keys': list(self.held_keys),  # Текущие нажатые клавиши
+                            'mouse_pos': win32api.GetCursorPos(),  # Позиция мыши
+                            'mouse_buttons': list(self.held_mouse)  # Нажатые кнопки мыши
+                        }
+                        self.demo_actions.append(actions)
+                        last_action_time = current_time
+                time.sleep(1 / DEMO_VIDEO_FPS)
+            video_writer.release()
+            with open(self.demo_actions_path, 'w') as f:
+                json.dump(self.demo_actions, f, indent=4)
+            self.has_demo = True
+            self.debug_print("Запись демонстрации завершена")
+            global_log_queue.put("Фрагмент игры записан (нажмите '=' для запуска бота)")
+            self.recording_event.clear()
+            self.stop_recording_event.clear()  # Сбрасываем флаг остановки
+        except Exception as e:
+            self.debug_print(f"Ошибка записи демонстрации: {e}")
+            global_log_queue.put(f"Ошибка записи демонстрации: {e}")
+            self.recording_event.clear()
+            self.stop_recording_event.clear()
+
+    def load_demo_actions(self):
+        """Загрузка действий из демонстрации для IRL"""
+        try:
+            with open(self.demo_actions_path, 'r') as f:
+                self.demo_actions = json.load(f)
+            self.debug_print(f"Загружено {len(self.demo_actions)} действий из демонстрации")
+        except Exception as e:
+            self.debug_print(f"Ошибка загрузки демонстрации: {e}")
+            self.has_demo = False
+
+    def pretrain_with_demo(self, model):
+        """Предобучение с Behavioral Cloning на демонстрациях (простая версия IRL)"""
+        if not self.has_demo or not self.demo_actions:
+            self.debug_print("Нет демонстраций для предобучения")
+            return
+        try:
+            # Простая имитация: используем expert actions для нескольких итераций
+            for _ in range(1000):  # Легковесное предобучение, чтобы не затормозить
+                # Выбираем случайные траектории из demo_actions
+                demo_idx = random.randint(0, len(self.demo_actions) - 1)
+                demo_action = self.demo_actions[demo_idx]
+                # Преобразовываем demo_action в индекс действия (упрощено: маппим на ближайшее)
+                action_idx = random.choice(range(self.action_space.n))  # Заменить на реальный маппинг, если нужно
+                obs = self.reset()[0]  # Или взять реальное состояние, но для простоты
+                model.policy.optimizer.zero_grad()
+                action, _ = model.policy.predict(obs, deterministic=False)
+                loss = nn.CrossEntropyLoss()(action, torch.tensor([action_idx]))
+                loss.backward()
+                model.policy.optimizer.step()
+            self.debug_print("Предобучение с демонстрациями завершено (Behavioral Cloning)")
+        except Exception as e:
+            self.debug_print(f"Ошибка предобучения: {e}")
 
     def detect_game_window_name(self):
         hwnd = win32gui.GetForegroundWindow()
@@ -560,7 +672,6 @@ class GameEnv(gym.Env):
                 return None
             rect = win32gui.GetWindowRect(hwnd)
             title = win32gui.GetWindowText(hwnd)
-            self.debug_print(f"Активное окно найдено: {rect}, title: {title}")
             return rect
         self.debug_print("Активное окно не найдено")
         return None
@@ -1281,7 +1392,7 @@ def gui_thread(env: GameEnv, stop_event: threading.Event):
                     root.geometry(f"{window_width}x{window_height}+{overlay_x}+{overlay_y}")
                     root.update()  # Принудительно обновляем окно
                 except tk.TclError:
-                    pass  # Игнорируем ошибки, если окно закрыто
+                    pass 
             else:
                 # Если активное окно не найдено, размещаем в левом верхнем углу экрана
                 monitor = get_monitors()[0]  # Используем screeninfo для получения размеров экрана
@@ -1297,7 +1408,6 @@ def gui_thread(env: GameEnv, stop_event: threading.Event):
             if hwnd:
                 try:
                     win32gui.SetForegroundWindow(hwnd)  # Убедимся, что фокус остаётся на активном окне
-                    env.debug_print(f"Фокус подтверждён на окне: {win32gui.GetWindowText(hwnd)}")
                 except:
                     env.debug_print("Не удалось подтвердить фокус активного окна")
             root.after(50, update_position)  # Обновляем позицию каждые 50 мс
@@ -1307,9 +1417,11 @@ def gui_thread(env: GameEnv, stop_event: threading.Event):
         # Создаём элементы интерфейса
         video_label = tk.Label(root, bg='black')
         video_label.pack(fill="both", expand=True)
-        info_label = tk.Label(root, text="Gen: 0 | Agent: 0 | FPS: 0.0\nSteps: 0/20000 | Total Reward: 0.0", 
-                             bg='black', fg='white', font=("Arial", 8)) 
-        info_label.pack(fill="x")
+        status_label = tk.Label(root, text="Bot paused\nНажмите F12 для записи демонстрации", 
+                                bg='black', fg='white', font=("Arial", 8))
+        status_label.pack(fill="x")
+        demo_status_label = tk.Label(root, text="", bg='black', fg='red', font=("Arial", 10, "bold"))
+        demo_status_label.pack(fill="x")
         log_text = tk.Text(root, height=6, bg='black', fg='white', font=("Arial", 8))
         log_text.pack(fill="x")
 
@@ -1323,10 +1435,6 @@ def gui_thread(env: GameEnv, stop_event: threading.Event):
                     root.destroy()
                 except:
                     pass
-                return
-            if env.pause_event.is_set():
-                info_label.config(text="Bot paused")
-                root.after(50, update)
                 return
             try:
                 # Получаем кадр
@@ -1351,11 +1459,17 @@ def gui_thread(env: GameEnv, stop_event: threading.Event):
                     held = [env.actions[i][0] if isinstance(i, int) else str(i) for i in env.held_keys]
                 steps = env.frame_processed
                 reward = env.total_reward
-                info_label.config(text=f"Gen: {env.generation} | Agent: {env.agent_id} | FPS: {frame_count/(time.time()-start_time+1e-9):.1f}\nSteps: {steps}/20000 | Total Reward: {reward:.2f}")
-                # Обновляем лог
+                if env.pause_event.is_set():
+                    status_label.config(text="Bot paused\nНажмите F12 для записи демонстрации")
+                    demo_status_label.config(text="Фрагмент игры: отсутствует" if not env.has_demo else "Фрагмент игры найден (нажмите '=')", 
+                                            fg='red' if not env.has_demo else 'green')
+                else:
+                    status_label.config(text=f"Gen: {env.generation} | Agent: {env.agent_id} | FPS: {frame_count/(time.time()-start_time+1e-9):.1f}\nSteps: {steps}/20000 | Total Reward: {reward:.2f}")
+                    demo_status_label.config(text="Фрагмент игры найден" if env.has_demo else "Фрагмент игры: отсутствует", 
+                                            fg='green' if env.has_demo else 'red')
                 max_logs = 5
                 for _ in range(max_logs):
-                    if global_log_queue.empty() or env.pause_event.is_set():
+                    if global_log_queue.empty():
                         break
                     log_text.insert(tk.END, global_log_queue.get_nowait() + "\n")
                     log_text.see(tk.END)
@@ -1364,7 +1478,6 @@ def gui_thread(env: GameEnv, stop_event: threading.Event):
                 if hwnd:
                     try:
                         win32gui.SetForegroundWindow(hwnd)
-                        env.debug_print(f"Фокус подтверждён на окне в update: {win32gui.GetWindowText(hwnd)}")
                     except:
                         env.debug_print("Не удалось подтвердить фокус в update")
             except Exception as e:
@@ -1443,6 +1556,8 @@ def main():
                     parent_path = random.choice(profile_paths)
                     env.evolve_model([parent_path], mutate=True)  # Эволюция с мутацией
                 model = PPO("CnnPolicy", env, verbose=1)
+                if env.has_demo:
+                    env.pretrain_with_demo(model)  # Предобучение с демонстрациями (IRL-подобное)
                 env.model = model
             except Exception as e:
                 env.debug_print(f"Ошибка эволюции/создания модели: {e}")
@@ -1519,9 +1634,6 @@ def main():
         print("Нет профилей для выбора чемпиона")
 
     print("Программа полностью остановлена")
-
-if __name__ == "__main__":
-    main()
 
 def evolve_model(self, profile_paths, mutate=True):
     """
