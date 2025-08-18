@@ -43,16 +43,18 @@ The bot was developed in just **two days**, so it is considered a work in progre
 9. Go to the **Advanced** tab.
 10. Click **Environment Variables**.
 11. In the **System Variables** section, locate the `PATH` variable and ensure `C:\Program Files\Tesseract-OCR` is included. If not, add it manually.
-12. Launch the game you want the bot to play.
-13. Run `Start.bat`.
+## Launch
+1. Launch OBS Studio and enable the virtual camera.
+2. Launch the game.
+3. Launch `Start.bat`.
+4. Switch to the game window so that the bot can recognize it.
+5. The bot will download YOLOv8 and begin training.
 
-The bot will download YOLOv8 and begin training.
+You can open the bot's graphical interface to monitor its actions, as well as observe the training process in the command line.
 
-You can open the bot’s GUI window to monitor its actions and view training progress in the command line.
-
-### Bot Controls
-- **=**: Pause the bot.
-- **Caps Lock**: Stop the bot and save training progress.
+### Controlling the bot
+- **“=”** : Pause the bot.
+- **“Caps Lock”** : Stop the bot and save the training progress.
 
 ---
 
@@ -99,16 +101,19 @@ You can open the bot’s GUI window to monitor its actions and view training pro
 9. Перейдите на вкладку **Дополнительно**.
 10. Нажмите **Переменные среды**.
 11. В разделе **Системные переменные** найдите переменную `PATH` и убедитесь, что в ней указан `C:\Program Files\Tesseract-OCR`. Если путь отсутствует, добавьте его вручную.
-12. Запустите игру, в которую должен играть бот.
-13. Запустите `Start.bat`.
 
-Бот скачает YOLOv8 и начнет обучение.
+## Запуск
+1. Запустите OBS Studio, включите виртуальную камеру.
+2. Запустите игру.
+3. Запустите `Start.bat`.
+4. Переключитесь на окно игры, чтоб бот его распознал
+5. Бот скачает YOLOv8 и начнет обучение.
 
 Вы можете открыть графический интерфейс бота, чтобы следить за его действиями, а также наблюдать за процессом обучения в командной строке.
 
 ### Управление ботом
-- **=**: Приостановить бота.
-- **Caps Lock**: Остановить бота и сохранить прогресс обучения.
+- **"="** : Приостановить бота.
+- **"Caps Lock"** : Остановить бота и сохранить прогресс обучения.
 
 ---
 
