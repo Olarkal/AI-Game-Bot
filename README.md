@@ -69,10 +69,17 @@ The bot was developed in **four days**, so it is considered incomplete and is pr
 9. In the **System Variables** section, find the `PATH` variable and make sure it contains `C:\Program Files\Tesseract-OCR`. If the path is missing, add it manually.
 
 ## Launch
-1. Launch OBS Studio, find the “Launch Virtual Camera” button, click on the gear next to it, and configure:
-- **Output Type**: Source
-- **Select Output**: Screen Capture
-2. Launch the game that the bot should play.
+1. Launch OBS Studio, find the “Start Virtual Camera” button, click on the gear icon next to it, and configure the following settings:  
+   - **Output Type**: Source  
+   - **Select Output**: Screen Capture
+2. Edit the bot on the line 46, specify your OBS virtual camera
+3. Edit the bot on the line 47, specify the Yolo model:
+  - YOLO_MODEL_PATH = “yolov8n.pt” - nano (Minimal model, very fast)
+  - YOLO_MODEL_PATH = “yolov8s.pt” - small (higher accuracy, but still fast)
+  - YOLO_MODEL_PATH = “yolov8m.pt” - medium (Balance between speed and accuracy. Well suited for medium GPUs (RTX 2060–3060).)
+  - YOLO_MODEL_PATH = “yolov8l.pt” - large (More accurate, but requires more resources.)
+  - YOLO_MODEL_PATH = “yolov8x.pt” - extra-large (The most powerful and accurate model. High GPU requirements (RTX 3090/4090 and similar are recommended))
+2. Launch the game the bot is supposed to play.
 3. Run `Start.bat`. The bot will download YOLOv8
 4. When the bot turns on the overlay, press F12 and play yourself. After half an hour, the bot will stop recording and start training.
 
@@ -155,6 +162,13 @@ The bot was developed in **four days**, so it is considered incomplete and is pr
 1. Запустите OBS Studio, найдите кнопку «Запуск виртуальной камеры», нажмите на шестеренку рядом и настройте:  
    - **Тип вывода**: Источник  
    - **Выбрать вывод**: Захват экрана
+2. Отредактируйте бота на строке 46 - укажите вашу OBS виртуальную камеру
+3. Отредактируйте бота на строке 47 - укажите модель Yolo:
+   - YOLO_MODEL_PATH = "yolov8n.pt" - nano (Минимальная модель, очень быстрая)
+   - YOLO_MODEL_PATH = "yolov8s.pt" - small (выше точность, но всё ещё быстрый)
+   - YOLO_MODEL_PATH = "yolov8m.pt" - medium (Баланс между скоростью и точностью. Хорошо подходит для средних GPU (RTX 2060–3060).)
+   - YOLO_MODEL_PATH = "yolov8l.pt" - large (Более точная, но требует больше ресурсов.)
+   - YOLO_MODEL_PATH = "yolov8x.pt" - extra-large (Самая мощная и точная модель. Высокие требования к GPU (лучше RTX 3090/4090 и аналогичные))
 2. Запустите игру, в которую должен играть бот.
 3. Запустите `Start.bat`. Бот скачает YOLOv8
 4. Когда бот включит оверлей, нажмите F12 и поиграйте сами. Через пол часа бот остановит запись и начнет обучение.
