@@ -28,7 +28,7 @@ Its structure and functionality include:
 
 Also, for a correct behavior profile, you need to record a demo for it at the beginning.
 
-After recording a 30-minute video, the bot will learn. Training consists of 100 agents with 20,000 steps per 1,000 generations.
+After recording a 15-minute video, the bot will learn. Training consists of 100 agents with 20,000 steps per 1,000 generations.
 The speed of the bot's learning will depend on the power of the video card.
 On average, the bot will be fully trained in ~7.9 years (SPS=40) to decades (SPS=10). So the feasibility is up to you to decide.
 
@@ -72,8 +72,8 @@ The bot was developed in **four days**, so it is considered incomplete and is pr
 1. Launch OBS Studio, find the “Start Virtual Camera” button, click on the gear icon next to it, and configure the following settings:  
    - **Output Type**: Source  
    - **Select Output**: Screen Capture
-2. Edit the bot on the line 46, specify your OBS virtual camera
-3. Edit the bot on the line 47, specify the Yolo model:
+2. Edit the bot on the line 50, specify your OBS virtual camera
+3. Edit the bot on the line 51, specify the Yolo model:
   - YOLO_MODEL_PATH = “yolov8n.pt” - nano (Minimal model, very fast)
   - YOLO_MODEL_PATH = “yolov8s.pt” - small (higher accuracy, but still fast)
   - YOLO_MODEL_PATH = “yolov8m.pt” - medium (Balance between speed and accuracy. Well suited for medium GPUs (RTX 2060–3060).)
@@ -118,7 +118,7 @@ The bot was developed in **four days**, so it is considered incomplete and is pr
 
 Также, для коректного профиля поведения, в начале требуется записать для него Демо.
 
-После записи 30 минутного видео, бот будет обучаться. Обучение составляет 100 агентов по 20 000 шагов на 1000 поколений.
+После записи 15 минутного видео, бот будет обучаться. Обучение составляет 100 агентов по 20 000 шагов на 1000 поколений.
 От мощности видеокарты будет зависеть скорость обучения бота.
 В среднем, бот полностью обучится за ~7.9 лет (SPS=40) до десятков лет (SPS=10). Так что целесообразность - вывод за вами
 
@@ -162,8 +162,8 @@ The bot was developed in **four days**, so it is considered incomplete and is pr
 1. Запустите OBS Studio, найдите кнопку «Запуск виртуальной камеры», нажмите на шестеренку рядом и настройте:  
    - **Тип вывода**: Источник  
    - **Выбрать вывод**: Захват экрана
-2. Отредактируйте бота на строке 46 - укажите вашу OBS виртуальную камеру
-3. Отредактируйте бота на строке 47 - укажите модель Yolo:
+2. Отредактируйте бота на строке 50 - укажите вашу OBS виртуальную камеру
+3. Отредактируйте бота на строке 51 - укажите модель Yolo:
    - YOLO_MODEL_PATH = "yolov8n.pt" - nano (Минимальная модель, очень быстрая)
    - YOLO_MODEL_PATH = "yolov8s.pt" - small (выше точность, но всё ещё быстрый)
    - YOLO_MODEL_PATH = "yolov8m.pt" - medium (Баланс между скоростью и точностью. Хорошо подходит для средних GPU (RTX 2060–3060).)
