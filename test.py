@@ -1,5 +1,6 @@
 import ctypes
 from ctypes import wintypes
+SendInput = ctypes.windll.user32.SendInput
 import time
 import threading
 import queue
@@ -10,6 +11,8 @@ import math
 import sys
 import traceback
 import re
+from collections import Counter
+from itertools import groupby
 
 import cv2
 import numpy as np
@@ -37,6 +40,7 @@ import win32gui
 import win32con
 import win32api
 import keyboard
+import pickle
 
 global_log_queue = queue.Queue(maxsize=100)
 global_stop_event = threading.Event()
@@ -47,7 +51,7 @@ OBS_CAMERA_INDEX = 2
 YOLO_MODEL_PATH = "yolov8m.pt"
 ENABLE_GUI = True
 DEFAULT_FRAME_RESIZE = (640, 480)
-DEMO_RECORD_DURATION = 1800  # 30 минут в секундах
+DEMO_RECORD_DURATION = 900  # 15 минут в секундах
 DEMO_VIDEO_FPS = 30  # FPS для записи видео
 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
@@ -155,6 +159,7 @@ def set_mouse_position(x, y):
     mi = MOUSEINPUT(abs_x, abs_y, 0, MOUSEEVENTF_MOVE | 0x8000, 0, ctypes.pointer(ctypes.c_ulong(0)))
     return INPUT(INPUT_MOUSE, _INPUTunion(mi=mi))
 
+
 # Полный мэппинг виртуальных ключей (без '=')
 
 VK = {
@@ -203,17 +208,61 @@ class FeatureNet(nn.Module):
         ).float()
     def forward(self, x):
         return self.cnn(x)
+        
+class SaveCallback:
+    def __init__(self, save_path, save_freq, env):
+        self.save_path = save_path
+        self.save_freq = save_freq
+        self.env = env
+        self.step = 0
+
+    def __call__(self, *args, **kwargs):
+        self.step += 1
+        if self.step % self.save_freq == 0:
+            self.env.save_training_state(self.save_path)
+            self.env.debug_print(f"Сохранение модели на шаге {self.step}")
+        return False
+
+class FrameCaptureThread(threading.Thread):
+    def __init__(self, env):
+        super().__init__(daemon=True)
+        self.env = env
+        self.latest_frame = None
+        self.lock = threading.Lock()
+        self.running = True
+
+    def run(self):
+        while self.running and not self.env.stop_event.is_set():
+            # Захват всегда, даже на паузе
+            for _ in range(5):
+                self.env.cap.grab()
+            ret, frame = self.env.cap.retrieve()
+            if ret:
+                with self.lock:
+                    self.latest_frame = frame.copy()
+                # В очередь только если не пауза
+                if not self.env.pause_event.is_set():
+                    try:
+                        if self.env.frame_queue.full():
+                            self.env.frame_queue.get_nowait()
+                        self.env.frame_queue.put(frame, timeout=0.01)
+                    except queue.Full:
+                        pass
+            time.sleep(0.005)
 
 # Основной класс среды
 
 class GameEnv(gym.Env):
-    active_gui = None 
+    active_gui = None
+
     def __init__(self, game_name="", profile_id=0, is_final_profile=False, generation=0):
         super(GameEnv, self).__init__()
+        self.threads = []
         self.profile_id = profile_id
         self.generation = generation
         self.agent_id = profile_id
         self.is_final_profile = is_final_profile
+        self.is_gui_destroyed = False
         self.total_reward = 0.0
         self.profile_performance = {}
         self.is_shooter = False
@@ -221,9 +270,10 @@ class GameEnv(gym.Env):
         self.stop_event = threading.Event()
         self.recording_event = threading.Event()
         self.stop_recording_event = threading.Event()
-        self.frame_queue = queue.Queue(maxsize=50)
-        self.action_queue = queue.Queue(maxsize=50)
-        self.send_queue = queue.Queue()
+        self.recording_active = False 
+        self.frame_queue = queue.Queue(maxsize=30)
+        self.action_queue = queue.Queue(maxsize=30)
+        self.send_queue = queue.Queue(maxsize=30)
         self.lock = threading.Lock()
         self.held_keys = set()
         self.held_mouse = set()
@@ -237,40 +287,41 @@ class GameEnv(gym.Env):
         self.annotated_frame = None
         self.yolo_results = None
         self.last_api_call = 0
-        self.api_call_interval = 2.0
+        self.api_call_interval = 0.1  # Уменьшено для FPS
         self.ui_mode = False
         self.current_frame = None
         self.current_reward = 0.0
         self.total_timesteps = 20000
         self.game_name = game_name or self.detect_game_window_name()
+        self.hwnd = win32gui.FindWindow(None, self.game_name)
+        if not self.hwnd:
+            self.debug_print("Окно игры не найдено, используется текущее активное окно")
+            self.hwnd = win32gui.GetForegroundWindow()
         self.cap = cv2.VideoCapture(OBS_CAMERA_INDEX, cv2.CAP_DSHOW)
         if not self.cap.isOpened():
             print("Не удалось открыть виртуальную камеру OBS. Попробуй другой индекс.")
             self.check_available_cameras()
             raise Exception("Не удалось открыть камеру")
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
+        self.cap.set(cv2.CAP_PROP_FPS, 60)
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or DEFAULT_FRAME_RESIZE[0]
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or DEFAULT_FRAME_RESIZE[1]
         self.debug_print(f"Виртуальная камера: {self.width}x{self.height}")
-
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if self.device.type == "cuda":
             self.debug_print(f"CUDA доступен: {torch.cuda.get_device_name(0)}")
         else:
             self.debug_print("CUDA недоступен, используется CPU")
-
-        # Инициализация YOLO на GPU
         self.model_yolo = YOLO(YOLO_MODEL_PATH).to(self.device)
         self.debug_print(f"YOLO device: {self.model_yolo.device}")
         self.observation_space = spaces.Box(low=0, high=255, shape=(84,84,3), dtype=np.uint8)
         self.actions = [
-            ("wait", []),
-            ("w", ["w"]), ("a", ["a"]), ("s", ["s"]), ("d", ["d"]),
+            ("wait", []), ("w", ["w"]), ("a", ["a"]), ("s", ["s"]), ("d", ["d"]),
             ("space", ["space"]), ("shift", ["shift"]), ("e", ["e"]), ("ctrl", ["ctrl"]),
             ("click_left", ["click_left"]), ("click_right", ["click_right"]),
             ("camera_left", ["camera_left"]), ("camera_right", ["camera_right"]),
             ("camera_up", ["camera_up"]), ("camera_down", ["camera_down"]),
-            ("aim_at_person", ["aim_at_person"])
+            ("aim_at_person", ["aim_at_person"]), ("hold_left", ["hold_left"])
         ]
         self.action_space = spaces.Discrete(len(self.actions))
         self.action_map = [
@@ -289,7 +340,8 @@ class GameEnv(gym.Env):
             {'keys': [], 'mouse_move': (700,0), 'mouse_click': None, 'duration': 0.12},
             {'keys': [], 'mouse_move': (0,-100), 'mouse_click': None, 'duration': 0.12},
             {'keys': [], 'mouse_move': (0,100), 'mouse_click': None, 'duration': 0.12},
-            {'keys': [], 'mouse_move': (0,0), 'mouse_click': None, 'duration': 0.2, 'aim_at_person': True}
+            {'keys': [], 'mouse_move': (0,0), 'mouse_click': None, 'duration': 0.2, 'aim_at_person': True},
+            {'keys': [], 'mouse_move': (0,0), 'mouse_click': 'hold_left', 'duration': 0.2, 'aim_at_person': True}
         ]
         config = self.load_config()
         self.game_description = config.get("game_description", "")
@@ -297,9 +349,9 @@ class GameEnv(gym.Env):
             self.debug_print("Получаю описание игры в интернете...")
             try:
                 self.fetch_game_description()
-                self.debug_print(f"Описание игры:, {self.game_description}")
+                self.debug_print(f"Описание игры: {self.game_description}")
             except Exception as e:
-                self.debug_print(f"Ошибка при получении описания:, {e}")
+                self.debug_print(f"Ошибка при получении описания: {e}")
         self.description_keywords, self.is_shooter = self.analyze_game_description()
         self.feature_net = FeatureNet().to(self.device).float()
         self.forward_model = nn.Sequential(
@@ -312,7 +364,9 @@ class GameEnv(gym.Env):
             lr=1e-3
         )
         self.model = None
-        self.threads = []
+        self.capture_thread = FrameCaptureThread(self)
+        self.capture_thread.start()
+        self.threads.append(self.capture_thread)
         self.send_worker_thread = threading.Thread(target=self._send_worker, daemon=True)
         self.threads.append(self.send_worker_thread)
         self.send_worker_thread.start()
@@ -328,7 +382,7 @@ class GameEnv(gym.Env):
         if ENABLE_GUI and GameEnv.active_gui is None:
             self.debug_print(f"Starting GUI for profile_id={self.profile_id}, is_final_profile={self.is_final_profile}")
             GameEnv.active_gui = self
-            gui_thread_instance = threading.Thread(target=gui_thread, args=(self, self.stop_event), daemon=True)
+            gui_thread_instance = threading.Thread(target=gui_thread, args=(self, self.stop_event), daemon=False)
             self.threads.append(gui_thread_instance)
             gui_thread_instance.start()
             self.debug_print("Запущен поток GUI")
@@ -338,35 +392,71 @@ class GameEnv(gym.Env):
         self.threads.append(console_thread)
         console_thread.start()
         self.restrict_cursor_to_window()
-        self.actions.append(("aim_at_person", ["aim_at_person"]))
-        self.action_map.append({'keys': [], 'mouse_move': (0,0), 'mouse_click': None, 'duration': 0.2, 'aim_at_person': True})
-
-        # Новые переменные для демонстраций (IRL)
-        self.demo_video_path = f"profiles/{self.game_name}/profile_{self.profile_id}/demo_video.avi"
-        self.demo_actions_path = f"profiles/{self.game_name}/profile_{self.profile_id}/demo_actions.json"
+        self.demo_cache = None
+        self.demo_access_count = 0
+        self.demo_video_path = f"profiles/{self.game_name}/shared_demo/demo_video.avi"
+        self.demo_actions_path = f"profiles/{self.game_name}/shared_demo/demo_actions.json"
         self.has_demo = os.path.exists(self.demo_video_path) and os.path.exists(self.demo_actions_path)
-        self.demo_actions = []  # Список для записи действий игрока
-        self.pause_event.set()  # Бот изначально на паузе
+        self.demo_actions = []
+        self.behavior_archetype = None
         if self.has_demo:
             self.load_demo_actions()
+            self.demo_access_count = 0
+            self.analyze_demo_behavior()
+        self.pause_event.set()
 
     def debug_print(self, message):
         if not self.pause_event.is_set():
             print(message)
 
+    def analyze_demo_behavior(self):
+        if not self.demo_actions:
+            self.debug_print("Нет действий в демо для анализа")
+            return
+
+        # Анализ частых действий
+        all_actions = [action['keys'] + action['mouse_buttons'] for action in self.demo_actions]
+        flat_actions = [item for sublist in all_actions for item in sublist]
+        action_counts = Counter(flat_actions)
+        most_common_actions = action_counts.most_common(5)
+
+        # Анализ последовательностей (например, цепочки действий)
+        sequences = []
+        for action in self.demo_actions:
+            seq = tuple(sorted(set(action['keys'] + action['mouse_buttons'])))
+            if seq:
+                sequences.append(seq)
+        sequence_groups = [(key, sum(1 for _ in group)) for key, group in groupby(sequences)]
+        common_sequences = sorted(sequence_groups, key=lambda x: x[1], reverse=True)[:5]
+
+        # Анализ движения мыши (средние dx, dy)
+        mouse_moves = [action['mouse_pos'] for action in self.demo_actions if action['mouse_pos'] != [0, 0]]
+        if mouse_moves:
+            avg_dx = sum(abs(pos[0]) for pos in mouse_moves) / len(mouse_moves)
+            avg_dy = sum(abs(pos[1]) for pos in mouse_moves) / len(mouse_moves)
+        else:
+            avg_dx, avg_dy = 0, 0
+
+        self.behavior_archetype = {
+            "most_common_actions": most_common_actions,
+            "common_sequences": common_sequences,
+            "average_mouse_movement": (avg_dx, avg_dy)
+        }
+        self.debug_print(f"Архетип поведения из демо: {json.dumps(self.behavior_archetype, indent=2)}")
+
     def save_training_state(self, save_path=None):
-        import os
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_path = save_path or f"profiles/{self.game_name}/profile_{self.profile_id}"
+        save_path = save_path or self.get_profile_dir()
         os.makedirs(save_path, exist_ok=True)
         try:
             if hasattr(self, 'model') and self.model is not None:
-                ppo_save_path = os.path.join(save_path, f"ppo_model_{timestamp}.zip")
+                ppo_save_path = os.path.join(save_path, f"model.zip")
                 self.model.save(ppo_save_path)
-                self.debug_print(f"PPO модель сохранена в {ppo_save_path}")
+                self.debug_print(f"PPO модель сохранена в {ppo_save_path}, Frames Processed: {self.frame_processed}")
                 config = self.load_config()
                 config["total_reward"] = self.total_reward
+                config["frame_processed"] = self.frame_processed
                 self.save_config(config)
         except Exception as e:
             self.debug_print(f"Ошибка при сохранении PPO модели: {e}")
@@ -431,7 +521,7 @@ class GameEnv(gym.Env):
         self.debug_print(f"Лучший профиль: {best_profile} с наградой {best_reward}")
 
         # Загружаем лучшую модель
-        ppo_files = [f for f in os.listdir(best_profile) if f.startswith("ppo_model_") and f.endswith(".zip")]
+        ppo_files = [f for f in os.listdir(best_profile) if f.endswith(".zip")]
         feature_net_files = [f for f in os.listdir(best_profile) if f.startswith("feature_net_") and f.endswith(".pth")]
         forward_model_files = [f for f in os.listdir(best_profile) if f.startswith("forward_model_") and f.endswith(".pth")]
         
@@ -463,30 +553,43 @@ class GameEnv(gym.Env):
 
     def cleanup(self):
         self.debug_print(f"Очистка GameEnv для profile_id={self.profile_id}")
+        self.save_training_state()
+        save_global_state(self.game_name, self.generation, int(self.profile_id) + 1,
+                  [self.get_profile_dir()], self.total_timesteps, 100)  # Используем значения из env, profile_paths с текущим
         self.stop_event.set()
+        self.pause_event.set()
+        self.is_gui_destroyed = True
         self.release_all_keys()
-        while not self.action_queue.empty():
+        for q in [self.frame_queue, self.action_queue, self.send_queue]:
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+        if hasattr(self, 'cap') and self.cap is not None and self.cap.isOpened():
+            self.cap.release()
+            self.debug_print("Освобождение видеозахвата")
+        if GameEnv.active_gui:
             try:
-                self.action_queue.get_nowait()
-            except queue.Empty:
-                break
-        while not self.send_queue.empty():
-            try:
-                self.send_queue.get_nowait()
-            except queue.Empty:
-                break
-        try:
-            if self.cap and self.cap.isOpened():
-                self.cap.release()
-                self.debug_print("Освобождение видеозахвата")
-        except:
-            self.debug_print("Ошибка при освобождении видеозахвата")
+                GameEnv.active_gui.quit()  # Завершаем цикл mainloop
+                GameEnv.active_gui.destroy()  # Закрываем окно
+                GameEnv.active_gui = None
+                self.debug_print("GUI закрыт в cleanup")
+            except Exception as e:
+                self.debug_print(f"Ошибка при закрытии GUI в cleanup: {e}")
+        self.threads = [t for t in self.threads if t.is_alive()]
         for thread in self.threads:
             if thread.is_alive():
                 self.debug_print(f"Ожидание потока {thread.name} для завершения")
-                thread.join(timeout=1.0)
-        if GameEnv.active_gui == self:
-            GameEnv.active_gui = None
+                if hasattr(thread, 'running'):
+                    thread.running = False
+                thread.join(timeout=3.0)
+                if thread.is_alive():
+                    self.debug_print(f"Поток {thread.name} не завершился вовремя, игнорируем")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            self.debug_print("Очищена память GPU")
+        self.debug_print("Очистка завершена")
 
     def console_listener(self, stop_event: threading.Event, pause_event: threading.Event):
         self.debug_print("Консольный слушатель запущен. Нажмите '=' для паузы/возобновления, 'Caps Lock' для остановки и сохранения, 'F12' для записи/остановки демонстрации")
@@ -511,38 +614,58 @@ class GameEnv(gym.Env):
                     while keyboard.is_pressed("="):
                         time.sleep(0.01)  # Ждём отпускания клавиши
                 if keyboard.is_pressed("f12"):
-                    if not self.recording_event.is_set():
-                        self.debug_print("F12 нажат, начало записи демонстрации (30 мин)")
-                        global_log_queue.put("Начало записи демонстрации (до 30 мин)")
+                    if not self.recording_active:
+                        # --- старт записи ---
                         self.recording_event.set()
-                        self.stop_recording_event.clear()  # Сбрасываем флаг остановки
+                        self.stop_recording_event.clear()
+                        self.recording_active = True
                         threading.Thread(target=self.record_demo, daemon=True).start()
+                        self.debug_print("Начата запись демонстрации")
+                        global_log_queue.put("Начата запись демонстрации")
                     else:
-                        self.debug_print("F12 нажат, остановка записи демонстрации")
-                        global_log_queue.put("Остановка записи демонстрации")
-                        self.stop_recording_event.set()  # Устанавливаем флаг остановки
+                        # --- остановка записи ---
+                        self.stop_recording_event.set()
+                        self.recording_event.clear()
+                        self.recording_active = False
+                        self.debug_print("Остановлена запись демонстрации")
+                        global_log_queue.put("Остановлена запись демонстрации")
+                        if hasattr(self, "active_gui") and self.active_gui:
+                            for widget in self.active_gui.winfo_children():
+                                if isinstance(widget, tk.Label):
+                                    widget.config(text="Bot paused")
+
+                    # ждём отпускания клавиши, чтобы не сработало несколько раз подряд
                     while keyboard.is_pressed("f12"):
-                        time.sleep(0.01)
+                        time.sleep(0.05)
                 if keyboard.is_pressed("capslock"):
                     self.debug_print("Caps Lock нажат, выключение бота")
+                    global_log_queue.put("Caps Lock нажат, сохранение состояния и остановка")
                     self.save_training_state()
+                    profile_paths = [self.get_profile_dir()]  # Текущий профиль агента
+                    completed = self.frame_processed >= 20000  # Убедитесь, что это совпадает с timesteps_per_agent
+                    next_agent = int(self.profile_id)  
+                    save_global_state(self.game_name, self.generation, next_agent, profile_paths, 1000, 100)
                     stop_event.set()
                     global_stop_event.set()
                     self.release_all_keys()
                     try:
-                        self.cap.release()
+                        if self.cap and self.cap.isOpened():
+                            self.cap.release()
+                            self.debug_print("Видеозахват освобождён")
                     except:
-                        pass
+                        self.debug_print("Ошибка при освобождении видеозахвата")
                     self.debug_print("Бот остановлен и состояние сохранено")
                     global_log_queue.put("Бот остановлен и сохранён")
+                    # Принудительный выход даже в паузе
+                    self.pause_event.clear()
                     while keyboard.is_pressed("capslock"):
                         time.sleep(0.01)
-                    break
+                    return
                 time.sleep(0.01)
             except Exception as e:
                 self.debug_print(f"Ошибка в console_listener: {e}")
-                traceback.print_exc()
                 time.sleep(1)
+        sys.exit(0)
 
     def record_demo(self):
         """Запись видео и действий игрока в течение 30 мин или до остановки"""
@@ -553,6 +676,32 @@ class GameEnv(gym.Env):
             self.demo_actions = []
             start_time = time.time()
             last_action_time = start_time
+            
+            key_map = {
+            'minus': '-', 'comma': ',', 'period': '.', 'slash': '/', 
+            'tilde': '`', 'lbracket': '[', 'rbracket': ']', 'backslash': '\\',
+            'apostrophe': "'", 'semicolon': ';'
+            }
+            
+            # Список клавиш для отслеживания (из VK)
+            tracked_keys = []
+            seen_keys = set()
+            for key in VK.keys():
+                mapped_key = key_map.get(key, key)
+                try:
+                    # Проверяем, поддерживается ли клавиша библиотекой keyboard
+                    keyboard.is_pressed(mapped_key)
+                    if mapped_key not in seen_keys:
+                        tracked_keys.append(mapped_key)
+                        seen_keys.add(mapped_key)
+                except ValueError:
+                    self.debug_print(f"Клавиша {mapped_key} не поддерживается библиотекой keyboard, пропускаем")
+                    continue
+                    
+            user32 = ctypes.windll.user32
+            user32.ClipCursor(None)
+            self.debug_print("Попытка отключить ограничение курсора для записи")
+        
             while (time.time() - start_time < DEMO_RECORD_DURATION and 
                    not self.stop_event.is_set() and 
                    not self.stop_recording_event.is_set()):
@@ -561,29 +710,74 @@ class GameEnv(gym.Env):
                     video_writer.write(frame)
                     # Запись действий (клавиш и мыши)
                     current_time = time.time()
-                    if current_time - last_action_time >= 0.1:  # Записываем действия каждые 0.1 сек
+                    if current_time - last_action_time >= 0.1:  # Записываем каждые 0.1 сек
+                        # Захват нажатых клавиш
+                        pressed_keys = set()
+                        for key in tracked_keys:
+                            try:
+                                if keyboard.is_pressed(key):
+                                    pressed_keys.add(key)
+                            except ValueError as e:
+                                self.debug_print(f"Ошибка при проверке клавиши {key}: {e}")
+                                continue
+                    
+                        # Захват состояния мыши
+                        mouse_buttons = []
+                        mouse_state = win32api.GetKeyState(0x01)  # ЛКМ
+                        if mouse_state < -1:  # Нажата
+                            mouse_buttons.append("left")
+                        mouse_state = win32api.GetKeyState(0x02)  # ПКМ
+                        if mouse_state < -1:
+                            mouse_buttons.append("right")
+                    
+                        # Получаем позицию мыши
+                        try:
+                            mouse_pos = win32api.GetCursorPos()
+                            self.debug_print(f"Позиция мыши: {mouse_pos}")
+                        except Exception as e:
+                            self.debug_print(f"Ошибка при получении позиции мыши: {e}")
+                            mouse_pos = [960, 540]  #
+                        
                         actions = {
                             'timestamp': current_time - start_time,
-                            'keys': list(self.held_keys),  # Текущие нажатые клавиши
-                            'mouse_pos': win32api.GetCursorPos(),  # Позиция мыши
-                            'mouse_buttons': list(self.held_mouse)  # Нажатые кнопки мыши
+                            'keys': list(pressed_keys),
+                            'mouse_pos': list(mouse_pos),
+                            'mouse_buttons': mouse_buttons
                         }
                         self.demo_actions.append(actions)
                         last_action_time = current_time
-                time.sleep(1 / DEMO_VIDEO_FPS)
+                    time.sleep(1 / DEMO_VIDEO_FPS)
+            
+                else:
+                    self.debug_print("Не удалось захватить кадр во время записи")
+        
+            # Сохраняем действия в файл
+            try:
+                with open(self.demo_actions_path, 'w') as f:
+                    json.dump(self.demo_actions, f, indent=4)
+                self.debug_print(f"Действия сохранены в {self.demo_actions_path}")
+                self.has_demo = True  # Обновляем флаг, так как демонстрация записана
+                self.analyze_demo_behavior()  # Анализ после записи
+            except Exception as e:
+                self.debug_print(f"Ошибка при сохранении demo_actions.json: {e}")
+        
+            # Освобождаем ресурсы
             video_writer.release()
-            with open(self.demo_actions_path, 'w') as f:
-                json.dump(self.demo_actions, f, indent=4)
-            self.has_demo = True
-            self.debug_print("Запись демонстрации завершена")
-            global_log_queue.put("Фрагмент игры записан (нажмите '=' для запуска бота)")
+            self.debug_print("Запись демонстрации завершена, видео сохранено")
             self.recording_event.clear()
-            self.stop_recording_event.clear()  # Сбрасываем флаг остановки
+
+            # Восстанавливаем ограничение курсора
+            self.restrict_cursor_to_window()
+        
         except Exception as e:
-            self.debug_print(f"Ошибка записи демонстрации: {e}")
-            global_log_queue.put(f"Ошибка записи демонстрации: {e}")
-            self.recording_event.clear()
-            self.stop_recording_event.clear()
+            self.debug_print(f"Ошибка в record_demo: {e}")
+            try:
+                video_writer.release()
+            except:
+                pass
+            # Восстанавливаем ограничение курсора в случае ошибки
+            self.recording_event.clear() 
+            self.restrict_cursor_to_window()
 
     def load_demo_actions(self):
         """Загрузка действий из демонстрации для IRL"""
@@ -591,32 +785,121 @@ class GameEnv(gym.Env):
             with open(self.demo_actions_path, 'r') as f:
                 self.demo_actions = json.load(f)
             self.debug_print(f"Загружено {len(self.demo_actions)} действий из демонстрации")
+            self.analyze_demo_behavior()  # Анализ после загрузки
         except Exception as e:
             self.debug_print(f"Ошибка загрузки демонстрации: {e}")
             self.has_demo = False
 
     def pretrain_with_demo(self, model):
-        """Предобучение с Behavioral Cloning на демонстрациях (простая версия IRL)"""
         if not self.has_demo or not self.demo_actions:
             self.debug_print("Нет демонстраций для предобучения")
             return
-        try:
-            # Простая имитация: используем expert actions для нескольких итераций
-            for _ in range(1000):  # Легковесное предобучение, чтобы не затормозить
-                # Выбираем случайные траектории из demo_actions
-                demo_idx = random.randint(0, len(self.demo_actions) - 1)
-                demo_action = self.demo_actions[demo_idx]
-                # Преобразовываем demo_action в индекс действия (упрощено: маппим на ближайшее)
-                action_idx = random.choice(range(self.action_space.n))  # Заменить на реальный маппинг, если нужно
-                obs = self.reset()[0]  # Или взять реальное состояние, но для простоты
-                model.policy.optimizer.zero_grad()
-                action, _ = model.policy.predict(obs, deterministic=False)
-                loss = nn.CrossEntropyLoss()(action, torch.tensor([action_idx]))
-                loss.backward()
-                model.policy.optimizer.step()
-            self.debug_print("Предобучение с демонстрациями завершено (Behavioral Cloning)")
-        except Exception as e:
-            self.debug_print(f"Ошибка предобучения: {e}")
+        # Путь для кэша
+        cache_path = f"profiles/{self.game_name}/shared_demo/demo_segment_cache.pkl"
+    
+        # Проверяем наличие кэша
+        start_frame = 0  # Значение по умолчанию для start_frame
+        if hasattr(self, 'demo_cache') and self.demo_cache:
+            frames, segment_actions = self.demo_cache
+            self.debug_print("Используется кэшированный сегмент демки")
+        else:
+            # Открываем видео демки
+            cap = cv2.VideoCapture(self.demo_video_path)
+            if not cap.isOpened():
+                self.debug_print("Не удалось открыть видео демонстрации")
+                cap.release()
+                return
+
+            # Определяем длительность демки
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = DEMO_VIDEO_FPS  # 30 FPS
+            segment_duration = 3  # Уменьшаем до 3 секунд для оптимизации
+            segment_frames = segment_duration * fps  # 90 кадров
+
+            # Выбираем случайный начальный кадр
+            max_start_frame = max(0, total_frames - segment_frames)
+            start_frame = random.randint(0, max_start_frame)
+            start_time = start_frame / fps
+            end_time = start_time + segment_duration
+
+            # Находим действия в сегменте
+            segment_actions = [
+                action for action in self.demo_actions
+                if start_time <= action['timestamp'] <= end_time
+            ]
+
+            if not segment_actions:
+                self.debug_print("Нет действий в выбранном 3-секундном сегменте")
+                cap.release()
+                return
+
+            # Читаем и кэшируем кадры
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            frames = []
+            for i in range(segment_frames):
+                ret, frame = cap.read()
+                if not ret:
+                    self.debug_print(f"Не удалось прочитать кадр {i} из демки")
+                    break
+                # Ресайзим сразу до размера наблюдения (84x84)
+                frame = cv2.resize(frame, (84, 84))
+                frames.append(frame)
+
+            cap.release()
+
+            # Сохраняем в кэш (в память или файл)
+            self.demo_cache = (frames, segment_actions)
+            with open(cache_path, 'wb') as f:
+                pickle.dump(self.demo_cache, f)
+            self.debug_print(f"Кэширован сегмент демки с кадра {start_frame}")
+
+        # Определение функции маппинга действий
+        def map_demo_action_to_index(demo_action):
+            keys = demo_action.get('keys', [])
+            mouse_buttons = demo_action.get('mouse_buttons', [])
+            mouse_pos = demo_action.get('mouse_pos', [0, 0])
+
+            for idx, action in enumerate(self.actions):
+                action_name, action_keys = action
+                if set(keys).issubset(action_keys):
+                    return idx
+                if "left" in mouse_buttons and action_name == "click_left":
+                    return idx
+                if "right" in mouse_buttons and action_name == "click_right":
+                    return idx
+                if mouse_pos[0] != 0 or mouse_pos[1] != 0:
+                    if action_name in ["camera_left", "camera_right", "camera_up", "camera_down", "aim_at_person"]:
+                        return idx
+            return 0  # "wait" по умолчанию
+
+        # Обработка сегмента
+        fps = DEMO_VIDEO_FPS  # Определяем fps для использования в цикле
+        for i, frame in enumerate(frames):
+            # Находим ближайшее действие
+            current_time = (start_frame + i) / fps
+            closest_action = min(
+                segment_actions,
+                key=lambda x: abs(x['timestamp'] - current_time),
+                default=None
+            )
+
+            if closest_action:
+                try:
+                    obs = self.get_state(frame)
+                    action_idx = map_demo_action_to_index(closest_action)
+                    obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+                    with torch.no_grad():
+                        logits = model.policy(obs_tensor.unsqueeze(0))
+                    target = torch.tensor([action_idx], dtype=torch.long, device=self.device)
+                    loss = nn.CrossEntropyLoss()(logits, target)
+                    model.policy.optimizer.zero_grad()
+                    loss.backward()
+                    model.policy.optimizer.step()
+                except Exception as e:
+                    self.debug_print(f"Ошибка предобучения на кадре {i}: {e}")
+
+        self.demo_access_count += 1
+        self.debug_print(f"Предобучение завершено на 3-секундном сегменте" + (f" с кадра {start_frame}" if start_frame else ""))
 
     def detect_game_window_name(self):
         hwnd = win32gui.GetForegroundWindow()
@@ -685,8 +968,6 @@ class GameEnv(gym.Env):
                 pass
         else:
             ctypes.windll.user32.ClipCursor(None)
-        
-    # YOLO worker
 
     def _yolo_worker(self):
         transform = T.Compose([
@@ -722,8 +1003,6 @@ class GameEnv(gym.Env):
                 self.debug_print(f"YOLO worker error: {e}")
                 traceback.print_exc()
                 time.sleep(0.1)
-
-    # Send worker
 
     def _send_worker(self):
         while not self.stop_event.is_set():
@@ -794,8 +1073,6 @@ class GameEnv(gym.Env):
             except Exception as e:
                 self.debug_print(f"Send worker error: {e}")
 
-    # Action worker
-
     def _action_worker(self):
         while not self.stop_event.is_set():
             try:
@@ -850,20 +1127,19 @@ class GameEnv(gym.Env):
             except Exception as e:
                 self.debug_print(f"Action worker error:", {e})
 
-    # Frame capture worker
-
     def frame_capture_worker(self):
         while not self.stop_event.is_set():
-            if self.pause_event.is_set():
-                time.sleep(0.1)
-                continue
-            ret, frame = self.cap.read()
-            if ret:
-                with self.lock:
-                    self.current_frame = frame.copy()
-            time.sleep(0.03)
-
-    # Утилиты: press/hold/release
+            with self.capture_thread.lock:
+                if self.capture_thread.latest_frame is not None:
+                    with self.lock:
+                        # Копируем кадр всегда, чтобы YOLO и GUI видели его
+                        self.current_frame = self.capture_thread.latest_frame.copy()
+                        # Но если пауза — не кидаем в обучение/очередь
+                        if not self.pause_event.is_set():
+                            if self.frame_queue.full():
+                                self.frame_queue.get_nowait()
+                            self.frame_queue.put(self.current_frame, timeout=0.01)
+            time.sleep(0.005)
 
     def hold_key(self, key_name):
         vk = key_to_vk(key_name)
@@ -924,11 +1200,11 @@ class GameEnv(gym.Env):
             for key in list(self.held_keys):
                 vk = key_to_vk(key)
                 if vk is not None:
-                    self.send_queue.put({'type': 'key_up', 'vk': vk})
+                    self.send_queue.put({'type': 'release_keys', 'vks': [vk]})
                     self.debug_print(f"Отпущена клавиша: {key}")
             self.held_keys.clear()
         for button in list(self.held_mouse):
-            self.send_queue.put({'type': 'mouse_click_up', 'button': button})
+            self.send_queue.put({'type': 'mouse_click', 'button': button, 'down': False})
             self.debug_print(f"Отпущена кнопка мыши: {button}")
         self.held_mouse.clear()
         # Даём время на обработку команд отпускания
@@ -960,24 +1236,40 @@ class GameEnv(gym.Env):
         self.smooth_mouse_move(target_x, target_y, steps=steps, total_time=total_time)
 
     def aim_at_person(self, yolo_results):
-        if not yolo_results or not yolo_results[0].boxes.data.numel():
-            self.debug_print("No valid YOLO results for aiming")
+        if not self.hwnd:
+            self.debug_print("Ошибка: hwnd не определён")
             return
-        for det in yolo_results[0].boxes.data:
-            cls = int(det[5])
-            cls_name = yolo_results[0].names.get(cls, "").lower()
-            if cls_name == "person":
-                x1, y1, x2, y2 = det[:4].cpu().numpy()
-                center_x = (x1 + x2) / 2
-                center_y = (y1 + y2) / 2
-                game_rect = self.get_game_window_rect()
-                if game_rect:
-                    screen_x = game_rect[0] + (center_x / self.width) * (game_rect[2] - game_rect[0])
-                    screen_y = game_rect[1] + (center_y / self.height) * (game_rect[3] - game_rect[1])
-                    self.smooth_mouse_move(screen_x, screen_y, steps=10, total_time=0.2)
-                break
+        if yolo_results and yolo_results[0].boxes.data.tolist():
+            frame_height, frame_width = self.height, self.width
+            center_x_frame = frame_width / 2
+            center_y_frame = frame_height / 2
+            closest_person = None
+            min_distance = float('inf')
+        
+            for det in yolo_results[0].boxes.data:
+                cls = int(det[5])
+                if yolo_results[0].names.get(cls, "unknown").lower() == "person":
+                    x1, y1, x2, y2 = det[:4].cpu().numpy()
+                    center_x = (x1 + x2) / 2
+                    center_y = (y1 + y2) / 2
+                    distance = ((center_x - center_x_frame) ** 2 + (center_y - center_y_frame) ** 2) ** 0.5
+                    if distance < min_distance:
+                        min_distance = distance
+                        closest_person = (center_x, center_y)
+        
+            if closest_person:
+                center_x, center_y = closest_person
+                dx = center_x - center_x_frame
+                dy = center_y - center_y_frame
 
-    # Camera / OCR / YOLO helpers
+                window_rect = win32gui.GetWindowRect(self.hwnd)
+                screen_width, screen_height = window_rect[2] - window_rect[0], window_rect[3] - window_rect[1]
+                scale_x = screen_width / frame_width
+                scale_y = screen_height / frame_height
+                mouse_dx = int(dx * scale_x)
+                mouse_dy = int(dy * scale_y)
+                self.debug_print(f"Масштабирование: screen=({screen_width}, {screen_height}), mouse_dx={mouse_dx}, mouse_dy={mouse_dy}")
+                self.action_queue.put({'keys': [], 'mouse_move': (mouse_dx, mouse_dy), 'mouse_click': 'left', 'duration': 0.05})
 
     def check_available_cameras(self):
         index = 0
@@ -1020,11 +1312,7 @@ class GameEnv(gym.Env):
                 pass
         return False
 
-    # RL env methods
-
     def reset(self, **kwargs):
-        for _ in range(2):
-            self.cap.grab()
         ret, frame = self.cap.read()
         if ret:
             with self.lock:
@@ -1054,9 +1342,8 @@ class GameEnv(gym.Env):
 
     def step(self, action):
         start_time = time.time()
-        self.frame_processed += 1
+        new_state = np.zeros((84, 84, 3), dtype=np.uint8)
         reward = 0.0
-        enemy_reward = 0.0
         description_reward = 0.0
         done = False
         truncated = False
@@ -1079,7 +1366,10 @@ class GameEnv(gym.Env):
             global_log_queue.put("Бот приостановлен")
             return new_state, 0.0, False, False, {'ui_mode': self.ui_mode}
 
-        if self.frame_processed % 5 == 0:
+        # Если не на паузе — увеличиваем счетчик
+        self.frame_processed += 1
+
+        if self.frame_processed % 2 == 0:
             try:
                 img_tensor = torch.tensor(self.current_state.transpose(2,0,1)[None], dtype=torch.float32, device=self.device)
                 current_feature = self.feature_net(img_tensor)
@@ -1100,7 +1390,7 @@ class GameEnv(gym.Env):
                 self.debug_print(f"Ошибка при вычислении внутренней награды: {e}")
                 intrinsic = 0.0
         else:
-            intrinsic = 0.0
+            return new_state, 0.0, False, False, {}
 
         self.perform_action(action)
 
@@ -1109,7 +1399,7 @@ class GameEnv(gym.Env):
             with self.lock:
                 self.current_frame = frame.copy()
             new_state = self.get_state(frame)
-            ocr_text = self.prev_ocr_text if self.frame_processed % 10 != 0 else self.get_ocr_text(frame)
+            ocr_text = self.prev_ocr_text if self.frame_processed % 30 != 0 else self.get_ocr_text(frame)
         else:
             new_state = np.zeros_like(self.current_state)
             ocr_text = ""
@@ -1157,9 +1447,10 @@ class GameEnv(gym.Env):
                     frame_height, frame_width = self.height, self.width
                     center_x_frame = frame_width / 2
                     center_y_frame = frame_height / 2
-                    center_threshold = 0.01  # ~5 пикселей для 640x480
+                    center_threshold = 0.1  # ~30 пикселей для 640x480
 
                     detected_classes = []
+                    person_detected = False
                     for det in yolo_results[0].boxes.data:
                         cls = int(det[5])
                         cls_name = yolo_results[0].names.get(cls, "unknown").lower()
@@ -1167,12 +1458,17 @@ class GameEnv(gym.Env):
                         if cls_name in relevant_classes:
                             current_objects.add(cls_name)
                             if cls_name == "person" and self.is_shooter:
+                                person_detected = True
                                 x1, y1, x2, y2 = det[:4].cpu().numpy()
                                 center_x = (x1 + x2) / 2
                                 center_y = (y1 + y2) / 2
                                 is_in_center = (abs(center_x - center_x_frame) < frame_width * center_threshold and
                                                 abs(center_y - center_y_frame) < frame_height * center_threshold)
-                                if self.actions[action][0] == "click_left" and is_in_center:
+                                self.debug_print(f"Персонаж обнаружен, центр: ({center_x:.1f}, {center_y:.1f}), is_in_center: {is_in_center}")
+                                if self.actions[action][0] == "aim_at_person":
+                                    self.aim_at_person(yolo_results)
+                                    self.action_queue.put({'keys': [], 'mouse_click': 'left', 'duration': 0.05})
+                                if self.actions[action][0] in ["click_left", "hold_left"] and is_in_center:
                                     enemy_reward += 10.0
                                     self.debug_print(f"Вознаграждение за стрельбу по противнику в центре: {enemy_reward}")
                                 elif self.actions[action][0] == "aim_at_person":
@@ -1189,7 +1485,7 @@ class GameEnv(gym.Env):
                     self.debug_print(f"Обнаруженные классы YOLO: {detected_classes}")
 
                     # Штраф за случайный выстрел в шутерах
-                    if self.is_shooter and self.actions[action][0] == "click_left":
+                    if self.is_shooter and self.actions[action][0] in ["click_left", "hold_left"]: 
                         person_in_center = False
                         for det in yolo_results[0].boxes.data:
                             cls = int(det[5])
@@ -1203,8 +1499,11 @@ class GameEnv(gym.Env):
                                     person_in_center = True
                                     break
                         if not person_in_center:
-                            enemy_reward -= 1.5  # Увеличенный штраф за неточную стрельбу
+                            enemy_reward -= 3.0  # Увеличенный штраф за неточную стрельбу
                             self.debug_print("Штраф за случайный выстрел: -1.5")
+                        elif not person_detected:
+                            enemy_reward -= 1.5  # Штраф за стрельбу/зажатие, если персонажа вообще нет
+                            self.debug_print(f"Штраф за {'случайный выстрел' if self.actions[action][0] == 'click_left' else 'зажатие кнопки'} без персонажа: -1.5")
 
                 new_objects = current_objects - self.prev_objects
                 exploration_reward = min(len(new_objects) * 0.5, 2.0)
@@ -1265,7 +1564,13 @@ class GameEnv(gym.Env):
         self.prev_ocr_text = ocr_text
         self.current_state = new_state
         self.debug_print(f"Step FPS: {1/(time.time()-start_time+1e-9):.1f}, Reward: {reward:.2f}, Enemy Reward: {enemy_reward:.2f}, Description Reward: {description_reward:.2f}")
-        return new_state, reward, done, truncated, {'ui_mode': self.ui_mode}
+        # Логирование архетипа на ~шаге 1000
+        if 990 <= self.frame_processed <= 1010 and self.behavior_archetype:
+            self.debug_print(f"Архетип поведения на шаге {self.frame_processed}: {json.dumps(self.behavior_archetype, indent=2)}")
+        terminated = False  # Установите True, если эпизод завершён по правилам (например, смерть персонажа)
+        truncated = False  # Установите True, если завершён по лимиту времени или другой внешней причине
+        info = {}
+        return new_state, reward, terminated, truncated, info
 
     def calculate_change_reward(self, prev_frame, new_frame):
         if prev_frame is None:
@@ -1333,16 +1638,19 @@ class GameEnv(gym.Env):
             self.debug_print(f"Search object info error for {obj_name}: {e}")
             return []
 
+    def get_profile_dir(self):
+        return f"profiles/{self.game_name}/gen_{self.generation}_agent_{self.profile_id}"
+
     def load_config(self):
-        safe_name = re.sub(r'[:\\/*?"<>|]', "_", self.game_name)
-        profile_dir = f"profiles/{self.game_name}/profile_{self.profile_id}"
+        profile_dir = self.get_profile_dir()
         os.makedirs(profile_dir, exist_ok=True)
         config_path = f"{profile_dir}/config.json"
         default_config = {
             "actions": {str(i): act[0] for i, act in enumerate(self.actions)},
             "rewards": {},
             "known_objects": {},
-            "total_reward": 0.0
+            "total_reward": 0.0,
+            "frame_processed": 0
         }
         if not os.path.exists(config_path):
             with open(config_path, 'w') as f:
@@ -1353,149 +1661,169 @@ class GameEnv(gym.Env):
             config = {**default_config, **config}
             self.known_objects = config.get("known_objects", {})
             self.total_reward = config.get("total_reward", 0.0)
+            self.frame_processed = config.get("frame_processed", 0)
             return config
         
     def save_config(self, config=None):
-        profile_dir = f"profiles/{self.game_name}/profile_{self.profile_id}"
+        profile_dir = self.get_profile_dir()
         config_path = f"{profile_dir}/config.json"
         conf = config or{
             "actions": {str(i): act[0] for i, act in enumerate(self.actions)},
             "known_objects": self.known_objects,
-            "total_reward": self.total_reward
+            "total_reward": self.total_reward,
+            "frame_processed": self.frame_processed
         }
         with open(config_path, 'w') as f:
             json.dump(conf, f, indent=4)
 
-# GUI
 
 def gui_thread(env: GameEnv, stop_event: threading.Event):
     try:
         root = tk.Tk()
+        env.active_gui = root
         root.title("Bot Overlay")
-        root.overrideredirect(True)  # Убираем рамки окна
-        root.attributes('-topmost', True)  # Всегда сверху
-        root.attributes('-alpha', 0.8)  # Полупрозрачность
-        root.attributes('-disabled', True)  # Отключаем взаимодействие с окном
+        root.overrideredirect(True)
+        root.attributes('-topmost', True)
+        root.attributes('-alpha', 0.8)
+        root.attributes('-disabled', True)
 
-        # Размеры окна GUI
-        window_width = min(480, env.width // 2)  # Половина ширины окна, но не больше 480
-        window_height = int(window_width * (env.height / env.width)) + 120  # Сохраняем пропорции + место для текста
+        window_width = min(480, env.width // 2)
+        window_height = int(window_width * (env.height / env.width)) + 120
 
-        # Позиционирование оверлея слева по середине активного окна
         def update_position():
+            if stop_event.is_set() or global_stop_event.is_set():
+                try:
+                    root.quit()
+                    root.destroy()
+                    env.debug_print("GUI закрыт в update_position")
+                except tk.TclError:
+                    pass
+                return
             rect = env.get_game_window_rect()
             if rect:
                 game_x, game_y, game_w, game_h = rect
-                overlay_x = game_x + 10  
-                overlay_y = game_y + (game_h - window_height) // 2 
+                overlay_x = game_x + 10
+                overlay_y = game_y + (game_h - window_height) // 2
                 try:
                     root.geometry(f"{window_width}x{window_height}+{overlay_x}+{overlay_y}")
-                    root.update()  # Принудительно обновляем окно
+                    root.update()
                 except tk.TclError:
-                    pass 
+                    pass
             else:
-                # Если активное окно не найдено, размещаем в левом верхнем углу экрана
-                monitor = get_monitors()[0]  # Используем screeninfo для получения размеров экрана
+                monitor = get_monitors()[0]
                 overlay_x, overlay_y = 10, (monitor.height - window_height) // 2
                 try:
                     root.geometry(f"{window_width}x{window_height}+{overlay_x}+{overlay_y}")
                     root.update()
                 except tk.TclError:
                     pass
-                env.debug_print("Позиционирование оверлея на экране по умолчанию")
-            # Проверяем фокус активного окна
-            hwnd = win32gui.GetForegroundWindow()
-            if hwnd:
-                try:
-                    win32gui.SetForegroundWindow(hwnd)  # Убедимся, что фокус остаётся на активном окне
-                except:
-                    env.debug_print("Не удалось подтвердить фокус активного окна")
-            root.after(50, update_position)  # Обновляем позицию каждые 50 мс
+            root.after(100, update_position)
 
-        update_position()  # Инициализируем позицию
+        update_position()
 
-        # Создаём элементы интерфейса
         video_label = tk.Label(root, bg='black')
         video_label.pack(fill="both", expand=True)
-        status_label = tk.Label(root, text="Bot paused\nНажмите F12 для записи демонстрации", 
-                                bg='black', fg='white', font=("Arial", 8))
+        status_label = tk.Label(
+            root,
+            text="Gen: 0 | Agent: 0 | FPS: 0.0\nSteps: 0/20000 | Total Reward: 0.00",
+            bg='black', fg='white', font=("Arial", 8)
+        )
         status_label.pack(fill="x")
-        demo_status_label = tk.Label(root, text="", bg='black', fg='red', font=("Arial", 10, "bold"))
+        demo_status_label = tk.Label(root, text="", bg='black', fg='red', font=("Arial", 8))
         demo_status_label.pack(fill="x")
         log_text = tk.Text(root, height=6, bg='black', fg='white', font=("Arial", 8))
         log_text.pack(fill="x")
 
         frame_count = 0
         start_time = time.time()
+        last_update_time = 0
+        update_interval = 1 / 20
 
         def update():
-            nonlocal frame_count, start_time
-            if stop_event.is_set():
+            nonlocal last_update_time, frame_count, start_time
+            if stop_event.is_set() or global_stop_event.is_set():
                 try:
+                    root.quit()
                     root.destroy()
-                except:
+                    env.debug_print("GUI закрыт в update")
+                except tk.TclError:
                     pass
                 return
+
+            now = time.time()
+            if now - last_update_time < update_interval:
+                root.after(5, update)  # Проверяем чаще, но обновляем только через интервал
+                return
+            last_update_time = now
+
             try:
-                # Получаем кадр
+                # Берём кадр для GUI без блокировки основной обработки
                 with env.lock:
                     frame = env.annotated_frame if env.annotated_frame is not None else env.current_frame
                 if frame is None:
                     frame = np.zeros((env.height, env.width, 3), dtype=np.uint8)
+
+                # Изменяем размер один раз
                 display_w = window_width
                 display_h = int(display_w * (env.height / env.width))
                 frame_resized = cv2.resize(frame, (display_w, display_h))
+
+                # Конвертация для Tkinter
                 img = Image.fromarray(cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB))
                 imgtk = ImageTk.PhotoImage(image=img)
-                if not video_label.winfo_exists():
-                    return
-                try:
+
+                if video_label.winfo_exists():
                     video_label.imgtk = imgtk
                     video_label.configure(image=imgtk)
-                except tk.TclError:
-                    return
-                # Обновляем информацию
-                with env.held_keys_lock:
-                    held = [env.actions[i][0] if isinstance(i, int) else str(i) for i in env.held_keys]
+
+                # Обновление статуса
                 steps = env.frame_processed
                 reward = env.total_reward
+                status_text = f"Gen: {env.generation} | Agent: {env.agent_id} | FPS: {frame_count/(time.time()-start_time+1e-9):.1f}\nSteps: {steps}/20000 | Total Reward: {reward:.2f}"
                 if env.pause_event.is_set():
-                    status_label.config(text="Bot paused\nНажмите F12 для записи демонстрации")
-                    demo_status_label.config(text="Фрагмент игры: отсутствует" if not env.has_demo else "Фрагмент игры найден (нажмите '=')", 
-                                            fg='red' if not env.has_demo else 'green')
-                else:
-                    status_label.config(text=f"Gen: {env.generation} | Agent: {env.agent_id} | FPS: {frame_count/(time.time()-start_time+1e-9):.1f}\nSteps: {steps}/20000 | Total Reward: {reward:.2f}")
-                    demo_status_label.config(text="Фрагмент игры найден" if env.has_demo else "Фрагмент игры: отсутствует", 
-                                            fg='green' if env.has_demo else 'red')
+                    status_text += "\nPaused"
+                status_label.config(text=status_text)
+
+                # Demo статус
+                demo_status_label.config(
+                    text="Ведётся видеофиксация" if env.recording_active else 
+                         ("Фрагмент игры: отсутствует" if not env.has_demo else "Фрагмент игры найден (нажмите '=')"),
+                    fg='yellow' if env.recording_active else ('red' if not env.has_demo else 'green')
+                )
+
+                # Логи
                 max_logs = 5
                 for _ in range(max_logs):
                     if global_log_queue.empty():
                         break
                     log_text.insert(tk.END, global_log_queue.get_nowait() + "\n")
                     log_text.see(tk.END)
-                # Проверяем фокус активного окна
-                hwnd = win32gui.GetForegroundWindow()
-                if hwnd:
-                    try:
-                        win32gui.SetForegroundWindow(hwnd)
-                    except:
-                        env.debug_print("Не удалось подтвердить фокус в update")
+
             except Exception as e:
                 env.debug_print(f"GUI update error: {e}")
+
             frame_count += 1
             if frame_count % 30 == 0:
                 start_time = time.time()
                 frame_count = 0
-            root.after(30, update)  # 30 FPS
+
+            if not stop_event.is_set() and not global_stop_event.is_set():
+                root.after(5, update)
 
         update()
         root.mainloop()
     except Exception as e:
-        env.debug_print(f"GUI thread error: {e}")
-        import traceback; traceback.print_exc()
-        time.sleep(3)
-        if not stop_event.is_set():
-            gui_thread(env, stop_event)
+        env.debug_print(f"Ошибка потока GUI: {e}")
+        traceback.print_exc()
+    finally:
+        try:
+            root.quit()
+            root.destroy()
+            env.active_gui = None
+            env.debug_print("GUI закрыт в finally")
+        except (tk.TclError, NameError) as e:
+            env.debug_print(f"Ошибка при закрытии GUI в finally: {e}")
+    
 
 class StopCallback(BaseCallback):
     def __init__(self, stop_event):
@@ -1505,21 +1833,27 @@ class StopCallback(BaseCallback):
         return not self.stop_event.is_set()
 
 class SaveCallback(BaseCallback):
-    def __init__(self, save_path: str, save_freq: int):
+    def __init__(self, save_path: str, save_freq: int, env: GameEnv):
         super(SaveCallback, self).__init__()
         self.save_path = save_path
         self.save_freq = save_freq
+        self.env = env
+
     def _on_step(self) -> bool:
-        if self.n_calls % self.save_freq == 0:
-            try:
+        try:
+            # Сохраняем при достижении save_freq или при остановке
+            if self.n_calls % self.save_freq == 0 or self.env.stop_event.is_set() or global_stop_event.is_set():
                 self.model.save(self.save_path)
-                self.model.env.envs[0].save_training_state(save_path=os.path.dirname(self.save_path))
-                self.model.env.envs[0].debug_print(f"Model saved: {self.save_path}, Total Reward: {self.model.env.envs[0].total_reward}")
-            except Exception as e:
-                self.model.env.envs[0].debug_print("Save error:", e)
+                self.env.save_training_state(save_path=os.path.dirname(self.save_path))
+                self.env.debug_print(f"Model saved at step {self.n_calls}: {self.save_path}, Total Reward: {self.env.total_reward}, Frames Processed: {self.env.frame_processed}")
+        except Exception as e:
+            self.env.debug_print(f"Save error at step {self.n_calls}: {e}")
+        # Прерываем обучение, если установлен stop_event или global_stop_event
+        if self.env.stop_event.is_set() or global_stop_event.is_set():
+            self.env.debug_print("SaveCallback: обучение прервано по событию остановки")
+            return False
         return True
 
-# Main
 
 def get_game_name():
     hwnd = win32gui.GetForegroundWindow()
@@ -1527,113 +1861,211 @@ def get_game_name():
     print(f"Detected game window:", {title})
     return title if title else "UnknownGame"
 
+def save_global_state(game_name, current_gen, current_agent, profile_paths, generations, num_agents):
+    state_path = f"profiles/{game_name}/training_state.json"
+    os.makedirs(f"profiles/{game_name}", exist_ok=True)
+    state = {
+        "current_gen": current_gen,
+        "current_agent": current_agent,
+        "profile_paths": profile_paths,
+        "generations": generations,
+        "num_agents": num_agents
+    }
+    try:
+        with open(state_path, 'w') as f:
+            json.dump(state, f, indent=4)
+            print(f"Состояние сохранено в {state_path}")
+    except Exception as e:
+        print(f"Глобальное состояние сохранено: gen={current_gen}, agent={current_agent}")
+
+def load_global_state(game_name):
+    state_path = f"profiles/{game_name}/training_state.json"
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, 'r') as f:
+                state = json.load(f)
+                print(f"Состояние загружено из {state_path}")
+                return state
+        except Exception as e:
+            print(f"Ошибка при загрузке состояния из {state_path}: {e}")
+            return None
+    else:
+        print(f"Файл состояния {state_path} не найден, будет создан новый")
+        return None
+
 def main():
+    global global_stop_event, global_log_queue
+    global_stop_event = threading.Event()
+    global_log_queue = queue.Queue(maxsize=50)
+
     game_name = get_game_name()
-    generations = 1000
-    num_agents = 100
+    default_generations = 1000
+    default_num_agents = 100
     timesteps_per_agent = 20000
     elite_fraction = 0.2
     random_fraction = 0.1
     profile_paths = []
-
-    for gen in range(generations):
-        print(f"Поколение {gen + 1}/{generations}")
-        current_profile_paths = []
-        for agent_id in range(num_agents):
-            if global_stop_event.is_set():
-                print("Глобальное событие остановки установлено, выход из основного цикла")
-                return
-
-            profile_dir = f"profiles/{game_name}/gen_{gen}_agent_{agent_id}"
-            os.makedirs(profile_dir, exist_ok=True)
-            model_path = f"{profile_dir}/model.zip"
-
-            env = GameEnv(game_name, profile_id=agent_id, is_final_profile=False)
-            env.debug_print(f"Created env for gen={gen}, agent_id={agent_id}")
-
-            try:
-                if profile_paths:  # Если не первое поколение, эволюционируем из выбранных
-                    parent_path = random.choice(profile_paths)
-                    env.evolve_model([parent_path], mutate=True)  # Эволюция с мутацией
-                model = PPO("CnnPolicy", env, verbose=1)
-                if env.has_demo:
-                    env.pretrain_with_demo(model)  # Предобучение с демонстрациями (IRL-подобное)
-                env.model = model
-            except Exception as e:
-                env.debug_print(f"Ошибка эволюции/создания модели: {e}")
-                model = PPO("CnnPolicy", env, verbose=1)
-                env.model = model
-
-            config = env.load_config()
-            env.frame_processed = config.get("frame_processed", 0)
-            env.total_reward = config.get("total_reward", 0.0)
-
-            callbacks = [StopCallback(env.stop_event), SaveCallback(model_path, save_freq=5000)]
-            try:
-                model.learn(total_timesteps=timesteps_per_agent, callback=callbacks)
-                env.save_training_state()
-                current_profile_paths.append(profile_dir)
-            except KeyboardInterrupt:
-                env.save_training_state()
-                current_profile_paths.append(profile_dir)
-            except Exception as e:
-                traceback.print_exc()
-                env.save_training_state()
-                current_profile_paths.append(profile_dir)
-
-            config = env.load_config()
-            config["frame_processed"] = env.frame_processed
-            config["total_reward"] = env.total_reward
-            env.save_config(config)
-
-            env.cleanup()
-            time.sleep(1)  # Даём время на очистку ресурсов
-
-            if global_stop_event.is_set():
-                print("Глобальный стоп-событие установлено, пропуск дальнейших агентов")
-                break
-
-        # Отбор для следующего поколения
-        performances = []
-        for profile_path in current_profile_paths:
-            config_path = os.path.join(profile_path, "config.json")
-            if os.path.exists(config_path):
-                with open(config_path, 'r') as f:
-                    config = json.load(f)
-                    total_reward = config.get("total_reward", 0.0)
-                    performances.append((profile_path, total_reward))
-
-        if performances:
-            performances.sort(key=lambda x: x[1], reverse=True)
-            num_elite = int(num_agents * elite_fraction)
-            num_random = int(num_agents * random_fraction)
-            elite_paths = [p[0] for p in performances[:num_elite]]
-            remaining = performances[num_elite:]
-            random_paths = [p[0] for p in random.sample(remaining, min(num_random, len(remaining)))] if remaining else []
-            profile_paths = elite_paths + random_paths
-            print(f"Отобрано {len(profile_paths)} профилей для следующего поколения: {len(elite_paths)} элитных, {len(random_paths)} случайных")
-        else:
-            print("Нет профилей для отбора, завершение обучения")
-            break
-
-    # В конце выбираем чемпиона - лучший из последнего поколения
-    if performances:
-        champion_path = performances[0][0]
-        champion_reward = performances[0][1]
-        print(f"Чемпион найден в последнем поколении: {champion_path} с наградой {champion_reward}")
-        # Сохраняем чемпиона в отдельный профиль
-        final_profile_id = f"champion_gen_{gen}"
-        final_profile_dir = f"profiles/{game_name}/profile_{final_profile_id}"
-        os.makedirs(final_profile_dir, exist_ok=True)
-        final_env = GameEnv(game_name, profile_id=final_profile_id, is_final_profile=True)
-        final_env.evolve_model([champion_path], mutate=False)  # Загружаем без мутации
-        final_env.save_training_state(save_path=final_profile_dir)
-        final_env.cleanup()
-        final_env.debug_print(f"Чемпион сохранён в {final_profile_dir}")
+    
+    os.makedirs(f"profiles/{game_name}", exist_ok=True)
+    print(f"Создана директория profiles/{game_name}")
+    
+    state = load_global_state(game_name)
+    if state:
+        current_gen = state["current_gen"]
+        current_agent = state["current_agent"]
+        profile_paths = state["profile_paths"]
+        generations = state.get("generations", default_generations)
+        num_agents = state.get("num_agents", default_num_agents)
     else:
-        print("Нет профилей для выбора чемпиона")
+        current_gen = 0
+        current_agent = 0
+        profile_paths = []
+        generations = default_generations
+        num_agents = default_num_agents
+        save_global_state(game_name, current_gen, current_agent, profile_paths, generations, num_agents)
 
-    print("Программа полностью остановлена")
+    os.makedirs(f"profiles/{game_name}/shared_demo", exist_ok=True)
+
+    try:
+        while current_gen < generations:
+            if global_stop_event.is_set():
+                print("Глобальный стоп-событие установлено, выход из основного цикла")
+                break  # Прерываем главный цикл полностью
+            print(f"Поколение {current_gen + 1}/{generations}")
+            current_profile_paths = []
+                
+
+            for agent_id in range(current_agent, num_agents):
+                profile_dir = f"profiles/{game_name}/gen_{current_gen}_agent_{agent_id}"
+                os.makedirs(profile_dir, exist_ok=True)
+                model_path = os.path.join(profile_dir, "model.zip")
+
+                env = GameEnv(game_name, profile_id=agent_id, is_final_profile=False, generation=current_gen)
+                env.debug_print(f"Создано окружение для gen={current_gen}, agent_id={agent_id}")
+
+                current_profile_paths.append(profile_dir)
+                
+                if os.path.exists(model_path):
+                    try:
+                        model = PPO.load(model_path, env=env)
+                        config = env.load_config()
+                        env.frame_processed = config.get("frame_processed", 0)
+                        env.total_reward = config.get("total_reward", 0.0)
+                        env.debug_print(f"Загружена существующая модель для агента {agent_id} из {model_path}, обработано кадров: {env.frame_processed}")
+                    except Exception as e:
+                        env.debug_print(f"Не удалось загрузить модель {model_path}: {e}")
+                        model = PPO("CnnPolicy", env, n_steps=4096, verbose=1, batch_size=1024, device='cuda' if torch.cuda.is_available() else 'cpu')
+                        env.frame_processed = 0
+                        env.total_reward = 0.0
+                else:
+                    model = PPO("CnnPolicy", env, n_steps=4096, batch_size=1024, verbose=1, device='cuda' if torch.cuda.is_available() else 'cpu')
+                    env.frame_processed = 0
+                    env.total_reward = 0.0
+
+                if profile_paths:
+                    selected_parent = random.choice(profile_paths)
+                    env.evolve_model([selected_parent])
+                        
+                if env.has_demo and env.demo_access_count < 5:
+                    try:
+                        env.pretrain_with_demo(model)
+                    except Exception as e:
+                        env.debug_print(f"Ошибка в pretrain_with_demo для агента {agent_id}: {e}")
+                        traceback.print_exc()
+                            
+                env.model = model
+                callbacks = [StopCallback(env.stop_event), SaveCallback(model_path, save_freq=5000, env=env)]
+                remaining_timesteps = max(0, timesteps_per_agent - env.frame_processed)
+                    
+                while remaining_timesteps > 0 and not env.stop_event.is_set() and not global_stop_event.is_set():
+                    steps_to_run = min(1000, remaining_timesteps)
+                    try:
+                        model.learn(total_timesteps=steps_to_run, callback=callbacks)
+                    except Exception as e:
+                        env.debug_print(f"Ошибка обучения модели на шаге {env.frame_processed}: {e}")
+                        traceback.print_exc()
+                        break
+                            
+                    remaining_timesteps -= steps_to_run
+                        
+                    if env.has_demo and env.demo_access_count < 5 and env.frame_processed % 5000 == 0:
+                        try:
+                            env.pretrain_with_demo(model)
+                        except Exception as e:
+                            env.debug_print(f"Ошибка в pretrain_with_demo на шаге {env.frame_processed}: {e}")
+                            traceback.print_exc()
+                    
+                env.save_training_state()
+                config = env.load_config()
+                config["frame_processed"] = env.frame_processed
+                config["total_reward"] = env.total_reward
+                env.save_config(config)
+
+                save_global_state(game_name, current_gen, current_agent, profile_paths, generations, num_agents)
+
+                env.cleanup()
+                time.sleep(1)
+
+                if global_stop_event.is_set():
+                    print("Глобальный стоп-событие установлено, пропуск дальнейших агентов")
+                    break
+
+            # Отбор для следующего поколения
+            performances = []
+            for profile_path in current_profile_paths:
+                config_path = os.path.join(profile_path, "config.json")
+                if os.path.exists(config_path):
+                    with open(config_path, 'r') as f:
+                        cfg  = json.load(f)
+                        performances.append((profile_path, cfg.get("total_reward", 0.0)))
+
+
+            if performances:
+                performances.sort(key=lambda x: x[1], reverse=True)
+                num_elite = int(num_agents * elite_fraction)
+                num_random = int(num_agents * random_fraction)
+                elite_paths = [p[0] for p in performances[:num_elite]]
+                remaining = performances[num_elite:]
+                random_paths = [p[0] for p in random.sample(remaining, min(num_random, len(remaining)))] if remaining else []
+                profile_paths = elite_paths + random_paths
+                print(f"Отобрано {len(profile_paths)} профилей для следующего поколения: {len(elite_paths)} элитных, {len(random_paths)} случайных")
+
+            current_agent = 0
+            current_gen += 1
+            save_global_state(game_name, current_gen, current_agent, profile_paths, generations, num_agents)
+
+        # В конце выбираем чемпиона
+        if current_agent >= num_agents and performances:
+            champion_path = performances[0][0]
+            champion_reward = performances[0][1]
+            print(f"Чемпион найден в поколении {current_gen-1}: {champion_path} с наградой {champion_reward}")
+            final_profile_id = f"champion_gen_{current_gen-1}"
+            final_profile_dir = f"profiles/{game_name}/gen_{current_gen-1}_agent_{final_profile_id}"
+            os.makedirs(final_profile_dir, exist_ok=True)
+
+            final_env = GameEnv(game_name, profile_id=final_profile_id, is_final_profile=True, generation=current_gen-1)
+            final_env.evolve_model([champion_path])
+            final_env.save_training_state(save_path=final_profile_dir)
+            save_global_state(game_name, current_gen-1, final_profile_id, [final_profile_dir], generations, num_agents)
+            final_env.cleanup()
+            print(f"Чемпион сохранён в {final_profile_dir}")
+
+    except Exception as e:
+        print(f"Ошибка в main: {e}")
+        traceback.print_exc()
+    finally:
+        global_stop_event.set()
+        if 'env' in locals() and env is not None:
+            env.cleanup()
+        if 'final_env' in locals() and final_env is not None:
+            final_env.cleanup()
+        state_path = f"profiles/{game_name}/training_state.json"
+        if current_gen >= generations:
+            if os.path.exists(state_path):
+                os.remove(state_path)
+        else:
+            save_global_state(game_name, current_gen, current_agent, profile_paths, generations, num_agents)
+        print("Программа полностью остановлена")
 
 def evolve_model(self, profile_paths, mutate=True):
     """
@@ -1648,7 +2080,7 @@ def evolve_model(self, profile_paths, mutate=True):
     self.debug_print(f"Выбран профиль для эволюции: {selected_path}")
 
     # Загружаем модель из выбранного профиля
-    ppo_files = [f for f in os.listdir(selected_path) if f.startswith("ppo_model_") and f.endswith(".zip")]
+    ppo_files = [f for f in os.listdir(selected_path) if f.endswith(".zip")]
     feature_net_files = [f for f in os.listdir(selected_path) if f.startswith("feature_net_") and f.endswith(".pth")]
     forward_model_files = [f for f in os.listdir(selected_path) if f.startswith("forward_model_") and f.endswith(".pth")]
 
