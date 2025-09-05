@@ -69,25 +69,31 @@ The bot was developed in **four days**, so it is considered incomplete and is pr
 9. In the **System Variables** section, find the `PATH` variable and make sure it contains `C:\Program Files\Tesseract-OCR`. If the path is missing, add it manually.
 
 ## Launch
-1. Launch OBS Studio, find the “Start Virtual Camera” button, click on the gear icon next to it, and configure the following settings:  
+1. Edit the bot, line 51 and below:
+- OBS_CAMERA_INDEX = 2 #OBS virtual camera number (0-3)
+- YOLO_MODEL_PATH = “yolov8m.pt” #AI model (8n, 8s, 8m, 8l, 8x)
+- “yolov8n.pt” - nano (Minimal model, very fast)
+-	“yolov8s.pt” - small (higher accuracy, but still fast)
+- “yolov8m.pt” - medium (Balance between speed and accuracy. Well suited for medium GPUs (RTX 2060–3060).)
+- “yolov8l.pt” - large (More accurate, but requires more resources.)
+- “yolov8x.pt” - extra-large (The most powerful and accurate model. High GPU requirements (preferably RTX 3090/4090 and similar))
+- ENABLE_GUI = True #Overlay
+- DEMO_RECORD_DURATION = 900  # Demo recording time in seconds
+- DEMO_VIDEO_FPS = 30  # FPS for demo recording
+- MAX_PROFILES = 10  # Maximum number of profiles, minimum 500 for 3D games, 200 for 2D
+- TIMESTEPS_PER_AGENT = 120 #Number of steps for one agent, minimum 15,000 for 3D games, 10,000 for 2D games
+- MAX_GENS = 10 #Number of generations, minimum 80 for 3D games, 40 for 2D games
+- BIND_PAUSE = “f1” #pause button
+- BIND_STOP = “f3” #program exit button
+- BIND_RECORD = “f2” #demo recording button
+
+2. Launch OBS Studio, find the “Launch Virtual Camera” button, click on the gear next to it, and configure:  
    - **Output Type**: Source  
    - **Select Output**: Screen Capture
-2. Edit the bot on the line 50, specify your OBS virtual camera
-3. Edit the bot on the line 51, specify the Yolo model:
-  - YOLO_MODEL_PATH = “yolov8n.pt” - nano (Minimal model, very fast)
-  - YOLO_MODEL_PATH = “yolov8s.pt” - small (higher accuracy, but still fast)
-  - YOLO_MODEL_PATH = “yolov8m.pt” - medium (Balance between speed and accuracy. Well suited for medium GPUs (RTX 2060–3060).)
-  - YOLO_MODEL_PATH = “yolov8l.pt” - large (More accurate, but requires more resources.)
-  - YOLO_MODEL_PATH = “yolov8x.pt” - extra-large (The most powerful and accurate model. High GPU requirements (RTX 3090/4090 and similar are recommended))
-2. Launch the game the bot is supposed to play.
-3. Run `Start.bat`. The bot will download YOLOv8
-4. When the bot turns on the overlay, press F12 and play yourself. After half an hour, the bot will stop recording and start training.
-
-### Bot control
-- **F12** : Start/stop recording.
-- **=**: Pause the bot.
-- **Caps Lock**: Stop the bot and save the training progress.
-
+3. Launch the game that the bot should play.
+4. Run `Start.bat`. The bot will download YOLOv8
+5. When the bot turns on the overlay, press the demo recording button and play yourself. After a certain amount of time, the bot will stop recording.
+6. To start training each agent, press the pause button.
 ---
 
 ## Russian Version
@@ -159,24 +165,30 @@ The bot was developed in **four days**, so it is considered incomplete and is pr
 9. В разделе **Системные переменные** найдите переменную `PATH` и убедитесь, что в ней указан `C:\Program Files\Tesseract-OCR`. Если путь отсутствует, добавьте его вручную.
 
 ## Запуск
-1. Запустите OBS Studio, найдите кнопку «Запуск виртуальной камеры», нажмите на шестеренку рядом и настройте:  
+1. Отредактируйте бота, строка 51 и ниже:
+ - OBS_CAMERA_INDEX = 2 #Номер виртуальной камеры OBS (0-3)
+ - YOLO_MODEL_PATH = "yolov8m.pt" #Модель ИИ (8n, 8s, 8m, 8l, 8х)
+- "yolov8n.pt" - nano (Минимальная модель, очень быстрая)
+- "yolov8s.pt" - small (выше точность, но всё ещё быстрый)
+- "yolov8m.pt" - medium (Баланс между скоростью и точностью. Хорошо подходит для средних GPU (RTX 2060–3060).)
+- "yolov8l.pt" - large (Более точная, но требует больше ресурсов.)
+- "yolov8x.pt" - extra-large (Самая мощная и точная модель. Высокие требования к GPU (лучше RTX 3090/4090 и аналогичные))
+- ENABLE_GUI = True #Оверлей
+- DEMO_RECORD_DURATION = 900  # Время записи демки в секундах
+- DEMO_VIDEO_FPS = 30  # FPS для записи демки 
+- MAX_PROFILES = 10  # максимальное количество профилей, для 3D игры минимум 500, для 2D - 200
+- TIMESTEPS_PER_AGENT = 120 #Кол-во шагов для одного агента, для 3D игры минимум 15 000, для 2D - 10 000
+- MAX_GENS = 10 #Кол-во поколений, для 3D игры минимум 80, для 2D - 40
+- BIND_PAUSE = "f1" #кнопка паузы
+- BIND_STOP = "f3" #кнопка завершения программы
+- BIND_RECORD = "f2" #кнопка записи демо
+2. Запустите OBS Studio, найдите кнопку «Запуск виртуальной камеры», нажмите на шестеренку рядом и настройте:  
    - **Тип вывода**: Источник  
    - **Выбрать вывод**: Захват экрана
-2. Отредактируйте бота на строке 50 - укажите вашу OBS виртуальную камеру
-3. Отредактируйте бота на строке 51 - укажите модель Yolo:
-   - YOLO_MODEL_PATH = "yolov8n.pt" - nano (Минимальная модель, очень быстрая)
-   - YOLO_MODEL_PATH = "yolov8s.pt" - small (выше точность, но всё ещё быстрый)
-   - YOLO_MODEL_PATH = "yolov8m.pt" - medium (Баланс между скоростью и точностью. Хорошо подходит для средних GPU (RTX 2060–3060).)
-   - YOLO_MODEL_PATH = "yolov8l.pt" - large (Более точная, но требует больше ресурсов.)
-   - YOLO_MODEL_PATH = "yolov8x.pt" - extra-large (Самая мощная и точная модель. Высокие требования к GPU (лучше RTX 3090/4090 и аналогичные))
-2. Запустите игру, в которую должен играть бот.
-3. Запустите `Start.bat`. Бот скачает YOLOv8
-4. Когда бот включит оверлей, нажмите F12 и поиграйте сами. Через пол часа бот остановит запись и начнет обучение.
-
-### Управление ботом
-- **F12** : Начать/остановить запись.
-- **=**: Приостановить бота.
-- **Caps Lock**: Остановить бота и сохранить прогресс обучения.
+3. Запустите игру, в которую должен играть бот.
+4. Запустите `Start.bat`. Бот скачает YOLOv8
+5. Когда бот включит оверлей, нажмите кнопку для записи демо и поиграйте сами. Через н-ное время бот остановит запись.
+6. Для начала обучения каждого агента - нажмите кнопку паузы.
 
 ---
 
