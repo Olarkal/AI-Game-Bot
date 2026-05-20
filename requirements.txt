@@ -1,7 +1,7 @@
 numpy
 opencv-python
 pillow
-torch
+torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ultralytics
 pytesseract
 requests
