@@ -92,8 +92,9 @@ The bot was developed in **four days**, so it is considered incomplete and is pr
    - **Select Output**: Screen Capture
 3. Launch the game that the bot should play.
 4. Run `Start.bat`. The bot will download YOLOv8
-5. When the bot turns on the overlay, press the demo recording button and play yourself. After a certain amount of time, the bot will stop recording.
-6. To start training each agent, press the pause button.
+5. When the bot turns on the overlay, press F2 to the demo recording button and play yourself. After a certain amount of time, the bot will stop recording.
+6. To start training each agent, press the F1.
+7. To close application press F3
 ---
 
 ## Russian Version
@@ -187,8 +188,9 @@ The bot was developed in **four days**, so it is considered incomplete and is pr
    - **Выбрать вывод**: Захват экрана
 3. Запустите игру, в которую должен играть бот.
 4. Запустите `Start.bat`. Бот скачает YOLOv8
-5. Когда бот включит оверлей, нажмите кнопку для записи демо и поиграйте сами. Через н-ное время бот остановит запись.
-6. Для начала обучения каждого агента - нажмите кнопку паузы.
+5. Когда бот включит оверлей, нажмите кнопку F2 для записи демо и поиграйте сами. Через н-ное время бот остановит запись.
+6. Для начала обучения каждого агента - нажмите кнопку F1.
+7. Чтоб закрыть приложение, нажмите F3
 
 ---
 
